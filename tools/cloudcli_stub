@@ -1,0 +1,56 @@
+#!/bin/bash
+# cloudcli_stub - Test stub for cloudcli that stores files locally
+
+STORE_DIR="$HOME/.encfs_stub_store"
+mkdir -p "$STORE_DIR"
+
+case "$1" in
+    upload)
+        if [ $# -ne 2 ]; then
+            echo "Usage: cloudcli_stub upload <local_path>" >&2
+            exit 1
+        fi
+        local_path="$2"
+        if [ ! -f "$local_path" ]; then
+            echo "Error: file not found: $local_path" >&2
+            exit 1
+        fi
+        # Extract remote ID from filename (assuming it's <remote_id>.enc)
+        remote_id=$(basename "$local_path" .enc)
+        cp "$local_path" "$STORE_DIR/$remote_id"
+        echo "Uploaded $local_path -> $remote_id"
+        exit 0
+        ;;
+    download)
+        if [ $# -ne 3 ]; then
+            echo "Usage: cloudcli_stub download <remote_id> <local_path>" >&2
+            exit 1
+        fi
+        remote_id="$2"
+        local_path="$3"
+        if [ ! -f "$STORE_DIR/$remote_id" ]; then
+            echo "Error: remote file not found: $remote_id" >&2
+            exit 1
+        fi
+        cp "$STORE_DIR/$remote_id" "$local_path"
+        echo "Downloaded $remote_id -> $local_path"
+        exit 0
+        ;;
+    delete)
+        if [ $# -ne 2 ]; then
+            echo "Usage: cloudcli_stub delete <remote_id>" >&2
+            exit 1
+        fi
+        remote_id="$2"
+        if [ -f "$STORE_DIR/$remote_id" ]; then
+            rm "$STORE_DIR/$remote_id"
+            echo "Deleted $remote_id"
+        fi
+        exit 0
+        ;;
+    *)
+        echo "Usage: cloudcli_stub {upload|download|delete} [args...]" >&2
+        exit 1
+        ;;
+esac
+
