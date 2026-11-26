@@ -1,31 +1,186 @@
 #include "crypto.h"
+#include "util.h"
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
-#include <fstream>
-#include <cstring>
-#include <stdexcept>
-#include <functional>
+
 #include <algorithm>
+#include <cctype>
+#include <climits>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
 
 namespace encfs {
 
-// Magic bytes for encrypted file format
-static const uint8_t MAGIC[] = {0x45, 0x4E, 0x43, 0x46, 0x53}; // "ENCFS"
-static const uint8_t FORMAT_VERSION = 1;
+namespace {
 
-// KeyManager implementation
+const uint8_t kMagic[5] = {'E', 'N', 'C', 'F', 'S'};
+constexpr size_t kNonceSize = 12;
+constexpr size_t kTagSize = 16;
+constexpr size_t kSaltSize = 32;
+const char kChunkKeyLabel[] = "encfs-v2-chunk-key";
+
+struct CtxDeleter {
+    void operator()(EVP_CIPHER_CTX* ctx) const { EVP_CIPHER_CTX_free(ctx); }
+};
+using CtxPtr = std::unique_ptr<EVP_CIPHER_CTX, CtxDeleter>;
+
+// AES-256-GCM encrypt `len` bytes. `ct` must have room for `len` bytes.
+bool GcmEncrypt(const uint8_t* key, const uint8_t* nonce,
+                const uint8_t* aad, size_t aad_len,
+                const uint8_t* pt, size_t len,
+                uint8_t* ct, uint8_t* tag) {
+    if (len > INT_MAX || aad_len > INT_MAX) return false;
+    CtxPtr ctx(EVP_CIPHER_CTX_new());
+    if (!ctx) return false;
+
+    int outlen = 0;
+    uint8_t final_buf[16];
+    if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, key, nonce) != 1) return false;
+    if (aad_len > 0 &&
+        EVP_EncryptUpdate(ctx.get(), nullptr, &outlen, aad, static_cast<int>(aad_len)) != 1) {
+        return false;
+    }
+    if (len > 0 &&
+        EVP_EncryptUpdate(ctx.get(), ct, &outlen, pt, static_cast<int>(len)) != 1) {
+        return false;
+    }
+    return EVP_EncryptFinal_ex(ctx.get(), final_buf, &outlen) == 1 &&
+           EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, kTagSize, tag) == 1;
+}
+
+// AES-256-GCM decrypt + verify. `pt` must have room for `len` bytes. Returns
+// false if authentication fails; `pt` contents are then unspecified.
+bool GcmDecrypt(const uint8_t* key, const uint8_t* nonce,
+                const uint8_t* aad, size_t aad_len,
+                const uint8_t* ct, size_t len,
+                const uint8_t* tag, uint8_t* pt) {
+    if (len > INT_MAX || aad_len > INT_MAX) return false;
+    CtxPtr ctx(EVP_CIPHER_CTX_new());
+    if (!ctx) return false;
+
+    int outlen = 0;
+    uint8_t final_buf[16];
+    uint8_t tag_copy[kTagSize];
+    std::memcpy(tag_copy, tag, kTagSize);  // ctrl() takes a non-const pointer
+
+    if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, key, nonce) != 1) return false;
+    if (aad_len > 0 &&
+        EVP_DecryptUpdate(ctx.get(), nullptr, &outlen, aad, static_cast<int>(aad_len)) != 1) {
+        return false;
+    }
+    if (len > 0 &&
+        EVP_DecryptUpdate(ctx.get(), pt, &outlen, ct, static_cast<int>(len)) != 1) {
+        return false;
+    }
+    return EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, kTagSize, tag_copy) == 1 &&
+           EVP_DecryptFinal_ex(ctx.get(), final_buf, &outlen) == 1;
+}
+
+// STREAM nonce: 7 zero bytes | chunk index (big-endian u32) | final flag.
+void ChunkNonce(uint32_t index, bool last, uint8_t out[kNonceSize]) {
+    std::memset(out, 0, kNonceSize);
+    out[7] = static_cast<uint8_t>(index >> 24);
+    out[8] = static_cast<uint8_t>(index >> 16);
+    out[9] = static_cast<uint8_t>(index >> 8);
+    out[10] = static_cast<uint8_t>(index);
+    out[11] = last ? 1 : 0;
+}
+
+std::vector<uint8_t> BuildHeader(size_t chunk_size, const std::vector<uint8_t>& salt) {
+    std::vector<uint8_t> header(kMagic, kMagic + sizeof(kMagic));
+    header.push_back(ChunkedCrypto::FORMAT_VERSION);
+    AppendU32LE(header, static_cast<uint32_t>(chunk_size));
+    header.insert(header.end(), salt.begin(), salt.end());
+    return header;
+}
+
+std::vector<uint8_t> FileKey(const std::vector<uint8_t>& key, const uint8_t* salt) {
+    std::vector<uint8_t> info(kChunkKeyLabel, kChunkKeyLabel + sizeof(kChunkKeyLabel) - 1);
+    info.insert(info.end(), salt, salt + kSaltSize);
+    return HMAC::Compute(key, info);
+}
+
+std::vector<uint8_t> Concat(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    std::vector<uint8_t> out;
+    out.reserve(a.size() + b.size());
+    out.insert(out.end(), a.begin(), a.end());
+    out.insert(out.end(), b.begin(), b.end());
+    return out;
+}
+
+// Parse and validate a v2 header. Returns the chunk size.
+size_t ParseHeader(const uint8_t* header) {
+    if (std::memcmp(header, kMagic, sizeof(kMagic)) != 0) {
+        throw std::runtime_error("Invalid magic bytes");
+    }
+    if (header[5] != ChunkedCrypto::FORMAT_VERSION) {
+        throw std::runtime_error("Unsupported format version " + std::to_string(header[5]));
+    }
+    size_t chunk_size = LoadU32LE(header + 6);
+    if (chunk_size == 0 || chunk_size > ChunkedCrypto::MAX_CHUNK_SIZE) {
+        throw std::runtime_error("Invalid chunk size in header");
+    }
+    return chunk_size;
+}
+
+// Call read_fn until `n` bytes are read or it reports EOF.
+size_t ReadFull(const std::function<size_t(uint8_t*, size_t)>& read_fn, uint8_t* buf, size_t n) {
+    size_t total = 0;
+    while (total < n) {
+        size_t got = read_fn(buf + total, n - total);
+        if (got == 0) break;
+        total += got;
+    }
+    return total;
+}
+
+void CheckKey(const std::vector<uint8_t>& key) {
+    if (key.size() != kKeySize) throw std::runtime_error("Key must be 32 bytes");
+}
+
+} // namespace
+
+// ── KeyManager ──────────────────────────────────────────────────────────────
+
 std::vector<uint8_t> KeyManager::LoadKeyFromFile(const std::string& key_path) {
-    std::ifstream file(key_path, std::ios::binary);
-    if (!file) {
+    std::vector<uint8_t> raw;
+    if (!ReadWholeFile(key_path, raw)) {
         throw std::runtime_error("Failed to open key file: " + key_path);
     }
-    
-    std::vector<uint8_t> key(32);
-    file.read(reinterpret_cast<char*>(key.data()), 32);
-    if (file.gcount() != 32) {
-        throw std::runtime_error("Key file must be exactly 32 bytes");
+    if (raw.size() == kKeySize) {
+        return raw;  // raw binary key
     }
+
+    std::string text(raw.begin(), raw.end());
+    SecureWipe(raw);
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    text.erase(text.begin(), std::find_if(text.begin(), text.end(), not_space));
+    text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(), text.end());
+
+    std::vector<uint8_t> key;
+    bool ok = text.size() == kKeySize * 2 && HexDecode(text, key);
+    SecureWipe(text);
+    if (!ok) {
+        throw std::runtime_error(
+            "Key file must contain 64 hex characters or exactly 32 raw bytes: " + key_path);
+    }
+    return key;
+}
+
+std::vector<uint8_t> KeyManager::LoadLegacyKeyFromFile(const std::string& key_path) {
+    std::vector<uint8_t> raw;
+    if (!ReadWholeFile(key_path, raw)) {
+        throw std::runtime_error("Failed to open key file: " + key_path);
+    }
+    if (raw.size() < kKeySize) {
+        SecureWipe(raw);
+        throw std::runtime_error("Key file must be at least 32 bytes");
+    }
+    std::vector<uint8_t> key(raw.begin(), raw.begin() + kKeySize);
+    SecureWipe(raw);
     return key;
 }
 
@@ -34,36 +189,45 @@ std::vector<uint8_t> KeyManager::DeriveKeyFromPassphrase(
     const std::vector<uint8_t>& salt,
     int iterations
 ) {
-    std::vector<uint8_t> key(32);
+    if (iterations <= 0) throw std::runtime_error("PBKDF2 iterations must be positive");
+    std::vector<uint8_t> key(kKeySize);
     if (PKCS5_PBKDF2_HMAC(
-            passphrase.c_str(), passphrase.length(),
-            salt.data(), salt.size(),
+            passphrase.data(), static_cast<int>(passphrase.size()),
+            salt.data(), static_cast<int>(salt.size()),
             iterations,
             EVP_sha256(),
-            32, key.data()) != 1) {
+            static_cast<int>(key.size()), key.data()) != 1) {
         throw std::runtime_error("PBKDF2 key derivation failed");
     }
     return key;
 }
 
+std::vector<uint8_t> KeyManager::DeriveSubkey(const std::vector<uint8_t>& key,
+                                              const std::string& label) {
+    return HMAC::Compute(key, std::vector<uint8_t>(label.begin(), label.end()));
+}
+
 std::vector<uint8_t> KeyManager::RandomBytes(size_t count) {
     std::vector<uint8_t> bytes(count);
-    if (RAND_bytes(bytes.data(), count) != 1) {
+    if (count > INT_MAX || RAND_bytes(bytes.data(), static_cast<int>(count)) != 1) {
         throw std::runtime_error("Failed to generate random bytes");
     }
     return bytes;
 }
 
-// HMAC implementation
+// ── HMAC ────────────────────────────────────────────────────────────────────
+
 std::vector<uint8_t> HMAC::Compute(
     const std::vector<uint8_t>& key,
     const std::vector<uint8_t>& data
 ) {
     std::vector<uint8_t> result(32);
     unsigned int len = 32;
-    ::HMAC(EVP_sha256(), key.data(), key.size(),
-           data.data(), data.size(),
-           result.data(), &len);
+    // ::HMAC — the OpenSSL function, not this class.
+    if (::HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+               data.data(), data.size(), result.data(), &len) == nullptr || len != 32) {
+        throw std::runtime_error("HMAC computation failed");
+    }
     return result;
 }
 
@@ -71,257 +235,154 @@ std::string HMAC::ComputeHex(
     const std::vector<uint8_t>& key,
     const std::string& data
 ) {
-    std::vector<uint8_t> hmac = Compute(key, std::vector<uint8_t>(data.begin(), data.end()));
-    std::string hex;
-    hex.reserve(64);
-    static const char hex_chars[] = "0123456789abcdef";
-    for (uint8_t b : hmac) {
-        hex += hex_chars[b >> 4];
-        hex += hex_chars[b & 0xf];
-    }
-    return hex;
+    std::vector<uint8_t> mac = Compute(key, std::vector<uint8_t>(data.begin(), data.end()));
+    return HexEncode(mac.data(), mac.size());
 }
 
-// SimpleCrypto implementation
+// ── SimpleCrypto ────────────────────────────────────────────────────────────
+
 std::vector<uint8_t> SimpleCrypto::Encrypt(
     const std::vector<uint8_t>& plaintext,
-    const std::vector<uint8_t>& key
+    const std::vector<uint8_t>& key,
+    const std::vector<uint8_t>& aad
 ) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        throw std::runtime_error("Failed to create cipher context");
-    }
-    
-    std::vector<uint8_t> nonce = KeyManager::RandomBytes(12);
-    std::vector<uint8_t> ciphertext(plaintext.size() + 16); // +16 for tag
-    int outlen, final_len;
-    
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) != 1 ||
-        EVP_EncryptUpdate(ctx, ciphertext.data(), &outlen, plaintext.data(), plaintext.size()) != 1 ||
-        EVP_EncryptFinal_ex(ctx, ciphertext.data() + outlen, &final_len) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, ciphertext.data() + plaintext.size()) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+    CheckKey(key);
+    std::vector<uint8_t> out = KeyManager::RandomBytes(kNonceSize);
+    out.resize(kNonceSize + plaintext.size() + kTagSize);
+    if (!GcmEncrypt(key.data(), out.data(), aad.data(), aad.size(),
+                    plaintext.data(), plaintext.size(),
+                    out.data() + kNonceSize, out.data() + kNonceSize + plaintext.size())) {
         throw std::runtime_error("Encryption failed");
     }
-    
-    EVP_CIPHER_CTX_free(ctx);
-    
-    // Prepend nonce
-    std::vector<uint8_t> result;
-    result.reserve(12 + plaintext.size() + 16);
-    result.insert(result.end(), nonce.begin(), nonce.end());
-    result.insert(result.end(), ciphertext.begin(), ciphertext.begin() + plaintext.size() + 16);
-    return result;
+    return out;
 }
 
 std::vector<uint8_t> SimpleCrypto::Decrypt(
     const std::vector<uint8_t>& ciphertext,
-    const std::vector<uint8_t>& key
+    const std::vector<uint8_t>& key,
+    const std::vector<uint8_t>& aad
 ) {
-    if (ciphertext.size() < 12 + 16) {
+    CheckKey(key);
+    if (ciphertext.size() < kNonceSize + kTagSize) {
         throw std::runtime_error("Ciphertext too short");
     }
-    
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        throw std::runtime_error("Failed to create cipher context");
-    }
-    
-    std::vector<uint8_t> nonce(ciphertext.begin(), ciphertext.begin() + 12);
-    std::vector<uint8_t> encrypted(ciphertext.begin() + 12, ciphertext.end() - 16);
-    std::vector<uint8_t> tag(ciphertext.end() - 16, ciphertext.end());
-    std::vector<uint8_t> plaintext(encrypted.size());
-    int outlen, final_len;
-    
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) != 1 ||
-        EVP_DecryptUpdate(ctx, plaintext.data(), &outlen, encrypted.data(), encrypted.size()) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag.data()) != 1 ||
-        EVP_DecryptFinal_ex(ctx, plaintext.data() + outlen, &final_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+    size_t len = ciphertext.size() - kNonceSize - kTagSize;
+    std::vector<uint8_t> plaintext(len);
+    if (!GcmDecrypt(key.data(), ciphertext.data(), aad.data(), aad.size(),
+                    ciphertext.data() + kNonceSize, len,
+                    ciphertext.data() + kNonceSize + len, plaintext.data())) {
+        SecureWipe(plaintext);
         throw std::runtime_error("Decryption failed");
     }
-    
-    EVP_CIPHER_CTX_free(ctx);
-    plaintext.resize(outlen);
     return plaintext;
 }
 
-// ChunkedCrypto helper functions
-std::vector<uint8_t> ChunkedCrypto::GenerateChunkNonce(
-    const std::vector<uint8_t>& file_nonce,
-    uint32_t chunk_index
-) {
-    std::vector<uint8_t> nonce(12);
-    std::memcpy(nonce.data(), file_nonce.data(), 8); // Use first 8 bytes of file nonce
-    // XOR chunk index into last 4 bytes
-    uint32_t* nonce_u32 = reinterpret_cast<uint32_t*>(nonce.data() + 8);
-    *nonce_u32 = chunk_index;
-    return nonce;
+// ── ChunkedCrypto (v2) ──────────────────────────────────────────────────────
+
+uint8_t ChunkedCrypto::PeekFormatVersion(const std::vector<uint8_t>& blob) {
+    if (blob.size() < 6 || std::memcmp(blob.data(), kMagic, sizeof(kMagic)) != 0) return 0;
+    return blob[5];
 }
 
-bool ChunkedCrypto::EncryptChunk(
-    const uint8_t* plaintext,
-    size_t plaintext_len,
-    const std::vector<uint8_t>& key,
-    const std::vector<uint8_t>& nonce,
-    std::vector<uint8_t>& ciphertext,
-    std::vector<uint8_t>& tag
-) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
-    
-    ciphertext.resize(plaintext_len);
-    tag.resize(16);
-    int outlen, final_len;
-    
-    bool success = 
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) == 1 &&
-        EVP_EncryptUpdate(ctx, ciphertext.data(), &outlen, plaintext, plaintext_len) == 1 &&
-        EVP_EncryptFinal_ex(ctx, ciphertext.data() + outlen, &final_len) == 1 &&
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()) == 1;
-    
-    EVP_CIPHER_CTX_free(ctx);
-    return success;
-}
-
-bool ChunkedCrypto::DecryptChunk(
-    const uint8_t* ciphertext,
-    size_t ciphertext_len,
-    const std::vector<uint8_t>& key,
-    const std::vector<uint8_t>& nonce,
-    const uint8_t* tag,
-    std::vector<uint8_t>& plaintext
-) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
-    
-    plaintext.resize(ciphertext_len);
-    int outlen, final_len;
-    
-    bool success =
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) == 1 &&
-        EVP_DecryptUpdate(ctx, plaintext.data(), &outlen, ciphertext, ciphertext_len) == 1 &&
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag) == 1 &&
-        EVP_DecryptFinal_ex(ctx, plaintext.data() + outlen, &final_len) == 1;
-    
-    EVP_CIPHER_CTX_free(ctx);
-    if (success) {
-        plaintext.resize(outlen);
-    }
-    return success;
-}
-
-// ChunkedCrypto main functions
 std::vector<uint8_t> ChunkedCrypto::Encrypt(
     const std::vector<uint8_t>& plaintext,
     const std::vector<uint8_t>& key,
-    size_t chunk_size
+    size_t chunk_size,
+    const std::vector<uint8_t>& aad
 ) {
-    if (plaintext.empty()) {
-        return {};
+    CheckKey(key);
+    if (chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE) {
+        throw std::runtime_error("Invalid chunk size");
     }
-    
-    // Generate file nonce (12 bytes)
-    std::vector<uint8_t> file_nonce = KeyManager::RandomBytes(12);
-    
-    // Calculate number of chunks
-    size_t num_chunks = (plaintext.size() + chunk_size - 1) / chunk_size;
-    
-    // Build header: magic (5) + version (1) + file_nonce (12) + num_chunks (4) = 22 bytes
-    std::vector<uint8_t> result;
-    result.reserve(22 + num_chunks * (4 + 12 + chunk_size + 16)); // Estimate
-    
-    // Write header
-    result.insert(result.end(), MAGIC, MAGIC + 5);
-    result.push_back(FORMAT_VERSION);
-    result.insert(result.end(), file_nonce.begin(), file_nonce.end());
-    
-    uint32_t num_chunks_u32 = static_cast<uint32_t>(num_chunks);
-    result.insert(result.end(), reinterpret_cast<uint8_t*>(&num_chunks_u32),
-                  reinterpret_cast<uint8_t*>(&num_chunks_u32) + 4);
-    
-    // Encrypt each chunk
+    size_t num_chunks = std::max<size_t>(1, (plaintext.size() + chunk_size - 1) / chunk_size);
+    if (num_chunks > UINT32_MAX) throw std::runtime_error("Plaintext too large");
+
+    std::vector<uint8_t> salt = KeyManager::RandomBytes(kSaltSize);
+    std::vector<uint8_t> header = BuildHeader(chunk_size, salt);
+    std::vector<uint8_t> file_key = FileKey(key, salt.data());
+    std::vector<uint8_t> full_aad = Concat(header, aad);
+
+    std::vector<uint8_t> out;
+    out.reserve(header.size() + plaintext.size() + num_chunks * (4 + kTagSize));
+    out.insert(out.end(), header.begin(), header.end());
+
     for (size_t i = 0; i < num_chunks; ++i) {
         size_t offset = i * chunk_size;
-        size_t chunk_len = std::min(chunk_size, plaintext.size() - offset);
-        
-        std::vector<uint8_t> chunk_nonce = GenerateChunkNonce(file_nonce, i);
-        std::vector<uint8_t> chunk_ciphertext, chunk_tag;
-        
-        if (!EncryptChunk(plaintext.data() + offset, chunk_len, key, chunk_nonce,
-                         chunk_ciphertext, chunk_tag)) {
+        size_t len = std::min(chunk_size, plaintext.size() - offset);
+        bool last = (i + 1 == num_chunks);
+
+        uint8_t nonce[kNonceSize];
+        ChunkNonce(static_cast<uint32_t>(i), last, nonce);
+
+        AppendU32LE(out, static_cast<uint32_t>(len));
+        size_t ct_pos = out.size();
+        out.resize(ct_pos + len + kTagSize);
+        if (!GcmEncrypt(file_key.data(), nonce, full_aad.data(), full_aad.size(),
+                        plaintext.data() + offset, len,
+                        out.data() + ct_pos, out.data() + ct_pos + len)) {
+            SecureWipe(file_key);
             throw std::runtime_error("Chunk encryption failed");
         }
-        
-        // Write chunk: size (4) + nonce (12) + ciphertext + tag (16)
-        uint32_t chunk_size_u32 = static_cast<uint32_t>(chunk_ciphertext.size());
-        result.insert(result.end(), reinterpret_cast<uint8_t*>(&chunk_size_u32),
-                      reinterpret_cast<uint8_t*>(&chunk_size_u32) + 4);
-        result.insert(result.end(), chunk_nonce.begin(), chunk_nonce.end());
-        result.insert(result.end(), chunk_ciphertext.begin(), chunk_ciphertext.end());
-        result.insert(result.end(), chunk_tag.begin(), chunk_tag.end());
     }
-    
-    return result;
+    SecureWipe(file_key);
+    return out;
 }
 
 std::vector<uint8_t> ChunkedCrypto::Decrypt(
     const std::vector<uint8_t>& ciphertext,
-    const std::vector<uint8_t>& key
+    const std::vector<uint8_t>& key,
+    const std::vector<uint8_t>& aad
 ) {
-    if (ciphertext.size() < 22) {
+    CheckKey(key);
+    if (ciphertext.size() < HEADER_SIZE) {
         throw std::runtime_error("Ciphertext too short");
     }
-    
-    // Read header
-    if (std::memcmp(ciphertext.data(), MAGIC, 5) != 0) {
-        throw std::runtime_error("Invalid magic bytes");
-    }
-    
-    if (ciphertext[5] != FORMAT_VERSION) {
-        throw std::runtime_error("Unsupported format version");
-    }
-    
-    std::vector<uint8_t> file_nonce(ciphertext.begin() + 6, ciphertext.begin() + 18);
-    uint32_t num_chunks;
-    std::memcpy(&num_chunks, ciphertext.data() + 18, 4);
-    
+    size_t chunk_size = ParseHeader(ciphertext.data());
+    std::vector<uint8_t> header(ciphertext.begin(), ciphertext.begin() + HEADER_SIZE);
+    std::vector<uint8_t> full_aad = Concat(header, aad);
+    std::vector<uint8_t> file_key = FileKey(key, ciphertext.data() + 10);
+
     std::vector<uint8_t> plaintext;
-    size_t offset = 22;
-    
-    // Decrypt each chunk
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-        if (offset + 4 > ciphertext.size()) {
-            throw std::runtime_error("Truncated ciphertext");
+    plaintext.reserve(ciphertext.size());
+
+    const size_t total = ciphertext.size();
+    size_t offset = HEADER_SIZE;
+    uint64_t index = 0;
+    bool saw_last = false;
+
+    try {
+        while (offset < total) {
+            if (index > UINT32_MAX) throw std::runtime_error("Too many chunks");
+            if (total - offset < 4) throw std::runtime_error("Truncated chunk header");
+            size_t len = LoadU32LE(ciphertext.data() + offset);
+            offset += 4;
+            if (len > chunk_size) throw std::runtime_error("Chunk larger than chunk size");
+            if (total - offset < len + kTagSize) throw std::runtime_error("Truncated chunk");
+
+            bool last = (offset + len + kTagSize == total);
+            if (!last && len != chunk_size) throw std::runtime_error("Short non-final chunk");
+
+            uint8_t nonce[kNonceSize];
+            ChunkNonce(static_cast<uint32_t>(index), last, nonce);
+
+            size_t pt_pos = plaintext.size();
+            plaintext.resize(pt_pos + len);
+            if (!GcmDecrypt(file_key.data(), nonce, full_aad.data(), full_aad.size(),
+                            ciphertext.data() + offset, len,
+                            ciphertext.data() + offset + len, plaintext.data() + pt_pos)) {
+                throw std::runtime_error("Chunk authentication failed");
+            }
+            offset += len + kTagSize;
+            ++index;
+            saw_last = last;
         }
-        
-        uint32_t chunk_size;
-        std::memcpy(&chunk_size, ciphertext.data() + offset, 4);
-        offset += 4;
-        
-        if (offset + 12 + chunk_size + 16 > ciphertext.size()) {
-            throw std::runtime_error("Truncated chunk");
-        }
-        
-        std::vector<uint8_t> chunk_nonce(ciphertext.begin() + offset, ciphertext.begin() + offset + 12);
-        offset += 12;
-        
-        std::vector<uint8_t> chunk_ciphertext(ciphertext.begin() + offset,
-                                              ciphertext.begin() + offset + chunk_size);
-        offset += chunk_size;
-        
-        std::vector<uint8_t> chunk_tag(ciphertext.begin() + offset, ciphertext.begin() + offset + 16);
-        offset += 16;
-        
-        std::vector<uint8_t> chunk_plaintext;
-        if (!DecryptChunk(chunk_ciphertext.data(), chunk_ciphertext.size(), key,
-                         chunk_nonce, chunk_tag.data(), chunk_plaintext)) {
-            throw std::runtime_error("Chunk decryption failed");
-        }
-        
-        plaintext.insert(plaintext.end(), chunk_plaintext.begin(), chunk_plaintext.end());
+        if (!saw_last) throw std::runtime_error("Truncated ciphertext: no chunks");
+    } catch (...) {
+        SecureWipe(plaintext);
+        SecureWipe(file_key);
+        throw;
     }
-    
+    SecureWipe(file_key);
     return plaintext;
 }
 
@@ -329,112 +390,158 @@ bool ChunkedCrypto::EncryptStream(
     std::function<size_t(uint8_t*, size_t)> read_fn,
     std::function<bool(const uint8_t*, size_t)> write_fn,
     const std::vector<uint8_t>& key,
-    size_t chunk_size
+    size_t chunk_size,
+    const std::vector<uint8_t>& aad
 ) {
-    // Generate file nonce
-    std::vector<uint8_t> file_nonce = KeyManager::RandomBytes(12);
-    
-    // Write header
-    if (!write_fn(MAGIC, 5) ||
-        !write_fn(&FORMAT_VERSION, 1) ||
-        !write_fn(file_nonce.data(), 12)) {
-        return false;
-    }
-    
-    std::vector<uint8_t> buffer(chunk_size);
-    uint32_t chunk_index = 0;
-    
-    while (true) {
-        size_t bytes_read = read_fn(buffer.data(), chunk_size);
-        if (bytes_read == 0) break;
-        
-        std::vector<uint8_t> chunk_nonce = GenerateChunkNonce(file_nonce, chunk_index);
-        std::vector<uint8_t> chunk_ciphertext, chunk_tag;
-        
-        if (!EncryptChunk(buffer.data(), bytes_read, key, chunk_nonce,
-                         chunk_ciphertext, chunk_tag)) {
-            return false;
+    if (key.size() != kKeySize || chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE) return false;
+
+    std::vector<uint8_t> salt = KeyManager::RandomBytes(kSaltSize);
+    std::vector<uint8_t> header = BuildHeader(chunk_size, salt);
+    std::vector<uint8_t> file_key = FileKey(key, salt.data());
+    std::vector<uint8_t> full_aad = Concat(header, aad);
+
+    if (!write_fn(header.data(), header.size())) return false;
+
+    // One chunk of look-ahead: we can only set the "final" flag on a chunk
+    // once we know nothing follows it.
+    std::vector<uint8_t> cur(chunk_size), next(chunk_size), ct(chunk_size);
+    size_t cur_len = ReadFull(read_fn, cur.data(), chunk_size);
+    uint32_t index = 0;
+    bool ok = true;
+
+    while (ok) {
+        size_t next_len = 0;
+        bool last = true;
+        if (cur_len == chunk_size) {
+            next_len = ReadFull(read_fn, next.data(), chunk_size);
+            last = (next_len == 0);
         }
-        
-        uint32_t chunk_size_u32 = static_cast<uint32_t>(chunk_ciphertext.size());
-        if (!write_fn(reinterpret_cast<uint8_t*>(&chunk_size_u32), 4) ||
-            !write_fn(chunk_nonce.data(), 12) ||
-            !write_fn(chunk_ciphertext.data(), chunk_ciphertext.size()) ||
-            !write_fn(chunk_tag.data(), 16)) {
-            return false;
-        }
-        
-        chunk_index++;
+
+        uint8_t nonce[kNonceSize];
+        uint8_t tag[kTagSize];
+        std::vector<uint8_t> len_le;
+        ChunkNonce(index, last, nonce);
+        AppendU32LE(len_le, static_cast<uint32_t>(cur_len));
+
+        ok = GcmEncrypt(file_key.data(), nonce, full_aad.data(), full_aad.size(),
+                        cur.data(), cur_len, ct.data(), tag) &&
+             write_fn(len_le.data(), len_le.size()) &&
+             (cur_len == 0 || write_fn(ct.data(), cur_len)) &&
+             write_fn(tag, kTagSize);
+
+        if (!ok || last) break;
+        if (index == UINT32_MAX) { ok = false; break; }
+        ++index;
+        std::swap(cur, next);
+        cur_len = next_len;
     }
-    
-    // Write final chunk count (we'll need to rewrite header, but for simplicity
-    // we'll write it at the end and reader will need to handle it)
-    // Actually, let's write it at the start after reading all chunks
-    // For now, simplified: write chunk count at end
-    return true;
+
+    SecureWipe(file_key);
+    SecureWipe(cur);
+    SecureWipe(next);
+    return ok;
 }
 
 bool ChunkedCrypto::DecryptStream(
     std::function<size_t(uint8_t*, size_t)> read_fn,
     std::function<bool(const uint8_t*, size_t)> write_fn,
+    const std::vector<uint8_t>& key,
+    const std::vector<uint8_t>& aad
+) {
+    if (key.size() != kKeySize) return false;
+
+    std::vector<uint8_t> header(HEADER_SIZE);
+    if (ReadFull(read_fn, header.data(), HEADER_SIZE) != HEADER_SIZE) return false;
+    size_t chunk_size;
+    try {
+        chunk_size = ParseHeader(header.data());
+    } catch (const std::exception&) {
+        return false;
+    }
+
+    std::vector<uint8_t> file_key = FileKey(key, header.data() + 10);
+    std::vector<uint8_t> full_aad = Concat(header, aad);
+    std::vector<uint8_t> ct, pt;
+    bool ok = false;
+
+    for (uint64_t index = 0; index <= UINT32_MAX; ++index) {
+        uint8_t len_le[4];
+        if (ReadFull(read_fn, len_le, 4) != 4) break;  // EOF before final chunk
+        size_t len = LoadU32LE(len_le);
+        if (len > chunk_size) break;
+
+        ct.resize(len + kTagSize);
+        pt.resize(len);
+        if (ReadFull(read_fn, ct.data(), ct.size()) != ct.size()) break;
+
+        // A short chunk can only be the final one. A full-size chunk is
+        // normally not final, but may be when the plaintext length is an
+        // exact multiple of the chunk size.
+        uint8_t nonce[kNonceSize];
+        bool last = (len < chunk_size);
+        ChunkNonce(static_cast<uint32_t>(index), last, nonce);
+        bool authed = GcmDecrypt(file_key.data(), nonce, full_aad.data(), full_aad.size(),
+                                 ct.data(), len, ct.data() + len, pt.data());
+        if (!authed && !last) {
+            last = true;
+            ChunkNonce(static_cast<uint32_t>(index), last, nonce);
+            authed = GcmDecrypt(file_key.data(), nonce, full_aad.data(), full_aad.size(),
+                                ct.data(), len, ct.data() + len, pt.data());
+        }
+        if (!authed) break;
+        if (len > 0 && !write_fn(pt.data(), len)) break;
+
+        if (last) {
+            uint8_t extra;
+            ok = (read_fn(&extra, 1) == 0);  // nothing may follow the final chunk
+            break;
+        }
+    }
+
+    SecureWipe(file_key);
+    SecureWipe(pt);
+    return ok;
+}
+
+// ── Legacy v1 format (read-only) ────────────────────────────────────────────
+// header: "ENCFS" | 0x01 | file_nonce(12) | num_chunks:u32
+// chunk:  len:u32 | nonce(12) | ciphertext | tag(16)
+
+std::vector<uint8_t> ChunkedCrypto::DecryptLegacyV1(
+    const std::vector<uint8_t>& ciphertext,
     const std::vector<uint8_t>& key
 ) {
-    // Read header
-    uint8_t magic[5];
-    if (read_fn(magic, 5) != 5 || std::memcmp(magic, MAGIC, 5) != 0) {
-        return false;
+    CheckKey(key);
+    constexpr size_t kV1Header = 22;
+    if (ciphertext.size() < kV1Header) throw std::runtime_error("Ciphertext too short");
+    if (std::memcmp(ciphertext.data(), kMagic, sizeof(kMagic)) != 0) {
+        throw std::runtime_error("Invalid magic bytes");
     }
-    
-    uint8_t version;
-    if (read_fn(&version, 1) != 1 || version != FORMAT_VERSION) {
-        return false;
-    }
-    
-    std::vector<uint8_t> file_nonce(12);
-    if (read_fn(file_nonce.data(), 12) != 12) {
-        return false;
-    }
-    
-    uint32_t num_chunks;
-    if (read_fn(reinterpret_cast<uint8_t*>(&num_chunks), 4) != 4) {
-        return false;
-    }
-    
-    // Decrypt chunks
+    if (ciphertext[5] != 1) throw std::runtime_error("Not a v1 blob");
+
+    uint32_t num_chunks = LoadU32LE(ciphertext.data() + 18);
+    std::vector<uint8_t> plaintext;
+    size_t offset = kV1Header;
+
     for (uint32_t i = 0; i < num_chunks; ++i) {
-        uint32_t chunk_size;
-        if (read_fn(reinterpret_cast<uint8_t*>(&chunk_size), 4) != 4) {
-            return false;
+        if (ciphertext.size() - offset < 4 + kNonceSize) throw std::runtime_error("Truncated ciphertext");
+        size_t len = LoadU32LE(ciphertext.data() + offset);
+        offset += 4;
+        const uint8_t* nonce = ciphertext.data() + offset;
+        offset += kNonceSize;
+        if (ciphertext.size() - offset < len + kTagSize) throw std::runtime_error("Truncated chunk");
+
+        size_t pt_pos = plaintext.size();
+        plaintext.resize(pt_pos + len);
+        if (!GcmDecrypt(key.data(), nonce, nullptr, 0,
+                        ciphertext.data() + offset, len,
+                        ciphertext.data() + offset + len, plaintext.data() + pt_pos)) {
+            SecureWipe(plaintext);
+            throw std::runtime_error("Chunk decryption failed");
         }
-        
-        std::vector<uint8_t> chunk_nonce(12);
-        if (read_fn(chunk_nonce.data(), 12) != 12) {
-            return false;
-        }
-        
-        std::vector<uint8_t> chunk_ciphertext(chunk_size);
-        if (read_fn(chunk_ciphertext.data(), chunk_size) != chunk_size) {
-            return false;
-        }
-        
-        std::vector<uint8_t> chunk_tag(16);
-        if (read_fn(chunk_tag.data(), 16) != 16) {
-            return false;
-        }
-        
-        std::vector<uint8_t> chunk_plaintext;
-        if (!DecryptChunk(chunk_ciphertext.data(), chunk_ciphertext.size(), key,
-                         chunk_nonce, chunk_tag.data(), chunk_plaintext)) {
-            return false;
-        }
-        
-        if (!write_fn(chunk_plaintext.data(), chunk_plaintext.size())) {
-            return false;
-        }
+        offset += len + kTagSize;
     }
-    
-    return true;
+    return plaintext;
 }
 
 } // namespace encfs
-

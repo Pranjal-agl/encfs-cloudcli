@@ -1,189 +1,199 @@
-#include "index.h"
 #include "crypto.h"
-#include <cassert>
-#include <iostream>
-#include <filesystem>
+#include "index.h"
+#include "util.h"
+#include "../test_util.h"
+
 #include <fstream>
-#include <cstring>
 
 using namespace encfs;
+using namespace encfs_test;
 
-void test_index_basic() {
-    std::cout << "Testing EncryptedIndex (basic operations)...\n";
-    
-    // Create temp directory
-    std::string test_dir = "/tmp/test_encfs_index";
-    std::filesystem::create_directories(test_dir);
-    
-    // Create key
-    std::vector<uint8_t> key(32, 0x42);
-    
-    EncryptedIndex index(test_dir, key);
-    
-    // Test empty index
-    assert(!index.Exists("test.txt"));
-    
-    // Add entry
-    FileMetadata meta;
-    meta.remote_id = "abc123";
-    meta.version = 1;
-    meta.size = 100;
-    meta.mtime = 1234567890;
-    index.SetMetadata("test.txt", meta);
-    
-    assert(index.Exists("test.txt"));
-    
-    FileMetadata retrieved;
-    assert(index.GetMetadata("test.txt", retrieved));
-    assert(retrieved.remote_id == "abc123");
-    assert(retrieved.version == 1);
-    assert(retrieved.size == 100);
-    
-    // Test reverse lookup
-    std::string plaintext;
-    assert(index.GetPlaintextName("abc123", plaintext));
-    assert(plaintext == "test.txt");
-    
-    // Save and reload
-    assert(index.Save());
-    
-    EncryptedIndex index2(test_dir, key);
-    assert(index2.Load());
-    assert(index2.Exists("test.txt"));
-    
-    FileMetadata retrieved2;
-    assert(index2.GetMetadata("test.txt", retrieved2));
-    assert(retrieved2.remote_id == "abc123");
-    
-    // Cleanup
-    std::filesystem::remove_all(test_dir);
-    
-    std::cout << "  ✓ Basic index tests passed\n";
+namespace {
+
+const std::vector<uint8_t> kKey(32, 0x42);
+
+FileMetadata Meta(const std::string& remote_id, uint64_t version, uint64_t size, int64_t mtime = 0) {
+    FileMetadata m;
+    m.remote_id = remote_id;
+    m.version = version;
+    m.size = size;
+    m.mtime = mtime;
+    return m;
 }
 
-void test_index_multiple_entries() {
-    std::cout << "Testing EncryptedIndex (multiple entries)...\n";
-    
-    std::string test_dir = "/tmp/test_encfs_index2";
-    std::filesystem::create_directories(test_dir);
-    
-    std::vector<uint8_t> key(32, 0x42);
-    EncryptedIndex index(test_dir, key);
-    
-    // Add multiple entries
+void TestBasic() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    CHECK(!index.FileExists());
+    CHECK(index.Load());  // missing index → empty, not an error
+    CHECK(!index.Exists("test.txt"));
+
+    index.SetMetadata("test.txt", Meta("abc123", 1, 100, 1234567890));
+    CHECK(index.Exists("test.txt"));
+
+    FileMetadata got;
+    CHECK(index.GetMetadata("test.txt", got));
+    CHECK(got.remote_id == "abc123" && got.version == 1 && got.size == 100 && got.mtime == 1234567890);
+
+    std::string name;
+    CHECK(index.GetPlaintextName("abc123", name) && name == "test.txt");
+
+    CHECK(index.Save());
+    CHECK(index.FileExists());
+
+    EncryptedIndex reloaded(dir.path(), kKey);
+    CHECK(reloaded.Load());
+    FileMetadata got2;
+    CHECK(reloaded.GetMetadata("test.txt", got2));
+    CHECK(got2.remote_id == "abc123" && got2.size == 100 && got2.mtime == 1234567890);
+}
+
+void TestMultipleEntriesAndRemoval() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
     for (int i = 0; i < 10; ++i) {
-        FileMetadata meta;
-        meta.remote_id = "remote_" + std::to_string(i);
-        meta.version = i;
-        meta.size = i * 100;
-        index.SetMetadata("file" + std::to_string(i) + ".txt", meta);
+        index.SetMetadata("file" + std::to_string(i) + ".txt",
+                          Meta("remote_" + std::to_string(i), i, i * 100));
     }
-    
-    assert(index.Save());
-    
-    EncryptedIndex index2(test_dir, key);
-    assert(index2.Load());
-    
+    CHECK(index.Size() == 10);
+    CHECK(index.Save());
+
+    EncryptedIndex index2(dir.path(), kKey);
+    CHECK(index2.Load());
     for (int i = 0; i < 10; ++i) {
-        assert(index2.Exists("file" + std::to_string(i) + ".txt"));
-        FileMetadata meta;
-        assert(index2.GetMetadata("file" + std::to_string(i) + ".txt", meta));
-        assert(meta.remote_id == "remote_" + std::to_string(i));
+        FileMetadata m;
+        CHECK(index2.GetMetadata("file" + std::to_string(i) + ".txt", m));
+        CHECK(m.remote_id == "remote_" + std::to_string(i));
     }
-    
-    // Test removal
+
     index2.Remove("file5.txt");
-    assert(!index2.Exists("file5.txt"));
-    assert(index2.Save());
-    
-    EncryptedIndex index3(test_dir, key);
-    assert(index3.Load());
-    assert(!index3.Exists("file5.txt"));
-    assert(index3.Exists("file4.txt"));
-    
-    std::filesystem::remove_all(test_dir);
-    
-    std::cout << "  ✓ Multiple entries tests passed\n";
+    std::string name;
+    CHECK(!index2.Exists("file5.txt"));
+    CHECK(!index2.GetPlaintextName("remote_5", name));  // reverse map cleaned too
+    CHECK(index2.Save());
+
+    EncryptedIndex index3(dir.path(), kKey);
+    CHECK(index3.Load());
+    CHECK(!index3.Exists("file5.txt"));
+    CHECK(index3.Exists("file4.txt"));
+    CHECK(index3.GetAllPlaintextNames().size() == 9);
 }
 
-void test_index_version_increment() {
-    std::cout << "Testing EncryptedIndex (version increment)...\n";
-    
-    std::string test_dir = "/tmp/test_encfs_index3";
-    std::filesystem::create_directories(test_dir);
-    
-    std::vector<uint8_t> key(32, 0x42);
-    EncryptedIndex index(test_dir, key);
-    
-    FileMetadata meta;
-    meta.remote_id = "remote1";
-    meta.version = 1;
-    index.SetMetadata("test.txt", meta);
-    
-    uint64_t v1 = index.IncrementVersion("test.txt");
-    assert(v1 == 2);
-    
-    uint64_t v2 = index.IncrementVersion("test.txt");
-    assert(v2 == 3);
-    
-    FileMetadata retrieved;
-    assert(index.GetMetadata("test.txt", retrieved));
-    assert(retrieved.version == 3);
-    
-    std::filesystem::remove_all(test_dir);
-    
-    std::cout << "  ✓ Version increment tests passed\n";
+void TestReplacingEntryUpdatesReverseMap() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    index.SetMetadata("a", Meta("id1", 1, 0));
+    index.SetMetadata("a", Meta("id2", 2, 0));
+    std::string name;
+    CHECK(!index.GetPlaintextName("id1", name));
+    CHECK(index.GetPlaintextName("id2", name) && name == "a");
 }
 
-void test_index_encryption() {
-    std::cout << "Testing EncryptedIndex (encryption)...\n";
-    
-    std::string test_dir = "/tmp/test_encfs_index4";
-    std::filesystem::create_directories(test_dir);
-    
-    std::vector<uint8_t> key(32, 0x42);
-    EncryptedIndex index(test_dir, key);
-    
-    FileMetadata meta;
-    meta.remote_id = "secret_remote_id";
-    meta.version = 1;
-    index.SetMetadata("secret_file.txt", meta);
-    assert(index.Save());
-    
-    // Try to load with wrong key - should fail
-    std::vector<uint8_t> wrong_key(32, 0x43);
-    EncryptedIndex index2(test_dir, wrong_key);
-    bool loaded = index2.Load();
-    // Should either fail to load or have wrong data
-    if (loaded) {
-        // If it loads, the data should be wrong
-        assert(!index2.Exists("secret_file.txt"));
+void TestVersionIncrement() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    index.SetMetadata("test.txt", Meta("remote1", 1, 0));
+    CHECK(index.IncrementVersion("test.txt") == 2);
+    CHECK(index.IncrementVersion("test.txt") == 3);
+    FileMetadata m;
+    CHECK(index.GetMetadata("test.txt", m) && m.version == 3);
+}
+
+void TestWrongKeyFailsWithoutClobbering() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    index.SetMetadata("secret_file.txt", Meta("secret_remote_id", 1, 0));
+    CHECK(index.Save());
+
+    std::vector<uint8_t> before;
+    CHECK(ReadWholeFile(dir / "index.enc", before));
+    // The plaintext name must not appear in the file on disk.
+    std::string raw(before.begin(), before.end());
+    CHECK(raw.find("secret_file") == std::string::npos);
+
+    EncryptedIndex wrong(dir.path(), std::vector<uint8_t>(32, 0x43));
+    wrong.SetMetadata("keep_me", Meta("x", 1, 0));
+    CHECK(!wrong.Load());            // must report failure...
+    CHECK(wrong.Exists("keep_me"));  // ...and leave in-memory state alone
+
+    std::vector<uint8_t> after;
+    CHECK(ReadWholeFile(dir / "index.enc", after) && after == before);
+
+    EncryptedIndex right(dir.path(), kKey);
+    CHECK(right.Load() && right.Exists("secret_file.txt"));
+}
+
+void TestCorruptIndexRejected() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    index.SetMetadata("f", Meta("id", 1, 0));
+    CHECK(index.Save());
+
+    std::vector<uint8_t> data;
+    CHECK(ReadWholeFile(dir / "index.enc", data));
+    data[data.size() / 2] ^= 0x80;
+    CHECK(WriteFileAtomic(dir / "index.enc", data));
+    EncryptedIndex corrupt(dir.path(), kKey);
+    CHECK(!corrupt.Load());
+
+    // A validly-encrypted but malformed payload is rejected too.
+    auto index_key = KeyManager::DeriveSubkey(kKey, "encfs_index_key_derivation");
+    std::vector<uint8_t> garbage = {5, 0, 0, 0, 0xff, 0xff};  // claims 5 entries, has none
+    CHECK(WriteFileAtomic(dir / "index.enc", SimpleCrypto::Encrypt(garbage, index_key)));
+    EncryptedIndex malformed(dir.path(), kKey);
+    CHECK(!malformed.Load());
+}
+
+void TestOnDiskFormatIsStable() {
+    // The serialized layout must stay compatible with indexes written by
+    // earlier versions. Build one by hand and make sure it loads.
+    TempDir dir;
+    std::vector<uint8_t> plain;
+    AppendU32LE(plain, 1);
+    std::string name = "notes.txt", id = "deadbeef";
+    AppendU32LE(plain, static_cast<uint32_t>(name.size()));
+    plain.insert(plain.end(), name.begin(), name.end());
+    AppendU32LE(plain, static_cast<uint32_t>(id.size()));
+    plain.insert(plain.end(), id.begin(), id.end());
+    AppendU64LE(plain, 7);           // version
+    AppendU64LE(plain, 42);          // size
+    AppendU64LE(plain, 1700000000);  // mtime
+
+    auto index_key = KeyManager::DeriveSubkey(kKey, "encfs_index_key_derivation");
+    CHECK(WriteFileAtomic(dir / "index.enc", SimpleCrypto::Encrypt(plain, index_key)));
+
+    EncryptedIndex index(dir.path(), kKey);
+    CHECK(index.Load());
+    FileMetadata m;
+    CHECK(index.GetMetadata("notes.txt", m));
+    CHECK(m.remote_id == "deadbeef" && m.version == 7 && m.size == 42 && m.mtime == 1700000000);
+}
+
+void TestUnicodeAndOddNames() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    const std::vector<std::string> names = {"résumé.pdf", "with space", "日本語.txt", "a'quote\"",
+                                            std::string("nul\0byte", 8)};
+    for (size_t i = 0; i < names.size(); ++i) {
+        index.SetMetadata(names[i], Meta("id" + std::to_string(i), 1, i));
     }
-    
-    // Load with correct key - should work
-    EncryptedIndex index3(test_dir, key);
-    assert(index3.Load());
-    assert(index3.Exists("secret_file.txt"));
-    
-    std::filesystem::remove_all(test_dir);
-    
-    std::cout << "  ✓ Encryption tests passed\n";
+    CHECK(index.Save());
+    EncryptedIndex reloaded(dir.path(), kKey);
+    CHECK(reloaded.Load());
+    for (const auto& n : names) CHECK(reloaded.Exists(n));
 }
+
+} // namespace
 
 int main() {
-    std::cout << "Running index unit tests...\n\n";
-    
-    try {
-        test_index_basic();
-        test_index_multiple_entries();
-        test_index_version_increment();
-        test_index_encryption();
-        
-        std::cout << "\n✓ All index tests passed!\n";
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "✗ Test failed: " << e.what() << "\n";
-        return 1;
-    }
+    return RunTests("index", {
+        {"Basic set/get/save/load", TestBasic},
+        {"Multiple entries and removal", TestMultipleEntriesAndRemoval},
+        {"Replacing an entry updates the reverse map", TestReplacingEntryUpdatesReverseMap},
+        {"Version increment", TestVersionIncrement},
+        {"Wrong key fails without clobbering state", TestWrongKeyFailsWithoutClobbering},
+        {"Corrupt or malformed index rejected", TestCorruptIndexRejected},
+        {"On-disk format is stable", TestOnDiskFormatIsStable},
+        {"Unicode and unusual filenames", TestUnicodeAndOddNames},
+    });
 }
-

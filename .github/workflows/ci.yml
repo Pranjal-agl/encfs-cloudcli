@@ -5,37 +5,53 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-22.04
-    
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Release
+            build_type: Release
+            sanitize: OFF
+          - name: Debug + ASan/UBSan
+            build_type: Debug
+            sanitize: ON
+
     steps:
-    - uses: actions/checkout@v3
-    
+    - uses: actions/checkout@v4
+
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          cmake \
-          libfuse3-dev \
-          libssl-dev \
-          pkg-config
-    
-    - name: Configure CMake
-      run: |
-        mkdir build
-        cd build
-        cmake ..
-    
-    - name: Build
-      run: |
-        cd build
-        make -j$(nproc)
-    
-    - name: Run tests
-      run: |
-        cd build
-        ctest --output-on-failure
+        sudo apt-get install -y build-essential cmake libfuse3-dev libssl-dev pkg-config fuse3
 
+    - name: Enable FUSE
+      run: |
+        sudo modprobe fuse || true
+        ls -l /dev/fuse
+
+    - name: Configure
+      run: >
+        cmake -S . -B build
+        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        -DENCFS_WERROR=ON
+        -DENCFS_SANITIZE=${{ matrix.sanitize }}
+        -DENCFS_E2E=ON
+
+    - name: Build
+      run: cmake --build build -j"$(nproc)"
+
+    - name: Test (unit, integration, FUSE end-to-end)
+      run: ctest --test-dir build --output-on-failure
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Lint shell scripts
+      run: shellcheck tools/cloudcli_stub tests/e2e/run_e2e.sh run_and_prove.sh

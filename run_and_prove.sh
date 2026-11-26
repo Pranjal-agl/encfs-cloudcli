@@ -1,162 +1,89 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================
-# run_and_prove.sh — Build, test, and live-demo encfs-cloudcli
-# Run this from the ProjC/ directory:
-#   cd ProjC && bash run_and_prove.sh
+# run_and_prove.sh — build, test, and live-demo encfs-cloudcli
+#
+#   ./run_and_prove.sh                 # build + test + demo
+#   ./run_and_prove.sh --install-deps  # apt-get the prerequisites first
+#
+# Everything runs in a throwaway temp directory: your ~/.encfs/key and any
+# existing mounts or backing directories are never touched.
 # =============================================================
 
-set -e
+set -euo pipefail
+
 BOLD='\033[1m'; GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
-banner() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $1${NC}"; echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}"; }
+banner() { echo -e "\n${BOLD}${CYAN}══ $1 ══${NC}"; }
 ok()     { echo -e "  ${GREEN}✓ $1${NC}"; }
 fail()   { echo -e "  ${RED}✗ $1${NC}"; exit 1; }
 
-# ── 0. Sanity: must be run from ProjC/ ───────────────────────
-[ -f CMakeLists.txt ] || { echo "ERROR: run this from the ProjC/ directory."; exit 1; }
+cd "$(dirname "$0")"
+ROOT=$(pwd)
 
-# ── 1. Install dependencies ───────────────────────────────────
-banner "STEP 1 — Installing dependencies"
-sudo apt-get update -qq
-sudo apt-get install -y build-essential cmake libfuse3-dev libssl-dev pkg-config fuse3
-ok "Dependencies installed"
+if [ "${1:-}" = "--install-deps" ]; then
+    banner "Installing dependencies"
+    sudo apt-get update -qq
+    sudo apt-get install -y build-essential cmake libfuse3-dev libssl-dev pkg-config fuse3
+fi
 
-# ── 2. Build ──────────────────────────────────────────────────
-banner "STEP 2 — Building project"
-rm -rf build && mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_VERBOSE_MAKEFILE=OFF 2>&1 | tail -5
-make -j"$(nproc)" 2>&1
-cd ..
+for tool in cmake pkg-config fusermount3 openssl; do
+    command -v "$tool" >/dev/null || fail "$tool not found (try: $0 --install-deps)"
+done
+
+banner "Building"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENCFS_E2E=ON >/dev/null
+cmake --build build -j"$(nproc)"
 ok "Build succeeded"
-echo "  Binaries in build/:"
-ls -lh build/encrypted_cloudfs build/test_crypto build/test_index build/test_integration build/decrypt_by_name 2>/dev/null
 
-# ── 3. Unit & integration tests ───────────────────────────────
-banner "STEP 3 — Running unit tests"
-cd build
-echo "--- test_crypto ---"
-./test_crypto && ok "test_crypto passed"
-echo ""
-echo "--- test_index ---"
-./test_index  && ok "test_index passed"
-cd ..
+banner "Running tests (unit, integration, FUSE end-to-end)"
+ctest --test-dir build --output-on-failure
+ok "All tests passed"
 
-banner "STEP 4 — Running integration tests"
-chmod +x tools/cloudcli_stub
-export PATH="$(pwd)/tools:$PATH"  # absolute so FUSE daemon inherits it correctly
-cd build
-echo "--- test_integration ---"
-./test_integration && ok "test_integration passed"
-cd ..
-
-# ── 5. Live FUSE mount demo ───────────────────────────────────
-banner "STEP 5 — Live FUSE mount demo"
-
-MOUNT="$HOME/enc_mount"
-BACKING="$HOME/enc_backing"
-KEY_FILE="$HOME/.encfs/key"
-
-# Clean up any leftover mounts
-fusermount3 -u "$MOUNT" 2>/dev/null || true
-rm -rf "$MOUNT" "$BACKING"
+banner "Live demo"
+DEMO=$(mktemp -d /tmp/encfs_demo.XXXXXX)
+MOUNT="$DEMO/mount"; BACKING="$DEMO/backing"; KEY="$DEMO/key"
+export ENCFS_STUB_STORE="$DEMO/cloud"
 mkdir -p "$MOUNT" "$BACKING"
+(umask 077 && openssl rand -hex 32 > "$KEY")
 
-# Generate encryption key
-mkdir -p ~/.encfs
-openssl rand -hex 32 > "$KEY_FILE"
-chmod 600 "$KEY_FILE"
-echo "  Key:     $KEY_FILE"
-echo "  Backing: $BACKING"
-echo "  Mount:   $MOUNT"
+FS_PID=""
+cleanup() {
+    fusermount3 -u "$MOUNT" 2>/dev/null || true
+    if [ -n "$FS_PID" ]; then wait "$FS_PID" 2>/dev/null || true; fi
+    rm -rf "$DEMO"
+}
+trap cleanup EXIT
 
-# Mount (background)
-env PATH="$PATH" ./build/encrypted_cloudfs "$MOUNT" "$BACKING" &
-FUSE_PID=$!
-sleep 1   # give FUSE time to start
+./build/encrypted_cloudfs -k "$KEY" -c "$ROOT/tools/cloudcli_stub" "$MOUNT" "$BACKING" \
+    >"$DEMO/fs.log" 2>&1 &
+FS_PID=$!
+for _ in $(seq 50); do mountpoint -q "$MOUNT" && break; sleep 0.1; done
+mountpoint -q "$MOUNT" || { cat "$DEMO/fs.log"; fail "mount failed"; }
+ok "Mounted at $MOUNT"
 
-# Verify mount is up
-mountpoint -q "$MOUNT" || fail "FUSE filesystem did not mount"
-ok "FUSE filesystem mounted (PID $FUSE_PID)"
+echo "Top secret quarterly numbers" > "$MOUNT/report.txt"
+echo "PS: also secret"              >> "$MOUNT/report.txt"
+echo "  Through the mount:"
+sed 's/^/    /' "$MOUNT/report.txt"
 
-echo ""
-echo -e "${BOLD}  ── Write tests ──${NC}"
-
-# Test 1: simple text file
-echo "Hello from encfs-cloudcli!" > "$MOUNT/hello.txt"
-READBACK=$(cat "$MOUNT/hello.txt")
-[ "$READBACK" = "Hello from encfs-cloudcli!" ] && ok "Write/read hello.txt: '$READBACK'" || fail "hello.txt mismatch"
-
-# Test 2: binary content (check byte-for-byte roundtrip)
-dd if=/dev/urandom bs=1K count=16 of=/tmp/random_input.bin 2>/dev/null
-cp /tmp/random_input.bin "$MOUNT/random.bin"
-cp "$MOUNT/random.bin" /tmp/random_output.bin
-cmp /tmp/random_input.bin /tmp/random_output.bin && ok "16 KiB binary roundtrip identical" || fail "Binary roundtrip mismatch"
-
-# Test 3: multiple files, readdir
-echo "file one"   > "$MOUNT/a.txt"
-echo "file two"   > "$MOUNT/b.txt"
-echo "file three" > "$MOUNT/c.txt"
-FILES=$(ls "$MOUNT" | sort | tr '\n' ' ')
-echo "  Directory listing: $FILES"
-[[ "$FILES" == *"a.txt"* ]] && [[ "$FILES" == *"b.txt"* ]] && [[ "$FILES" == *"c.txt"* ]] \
-    && ok "readdir sees all 3 files" || fail "readdir missing files"
-
-# Test 4: overwrite
-echo "original" > "$MOUNT/update.txt"
-echo "updated"  > "$MOUNT/update.txt"
-VAL=$(cat "$MOUNT/update.txt")
-[ "$VAL" = "updated" ] && ok "Overwrite works: '$VAL'" || fail "Overwrite failed"
-
-# Test 5: delete
-echo "to be deleted" > "$MOUNT/delete_me.txt"
-rm "$MOUNT/delete_me.txt"
-[ ! -f "$MOUNT/delete_me.txt" ] && ok "Delete works (file gone from mount)" || fail "Delete failed"
-
-echo ""
-echo -e "${BOLD}  ── Backing-store proof (files ARE encrypted on disk) ──${NC}"
-echo "  Backing dir contents:"
-ls -lh "$BACKING/"
-echo ""
-echo "  Hex dump of first encrypted blob (should look like random bytes):"
-FIRST_ENC=$(ls "$BACKING/"*.enc 2>/dev/null | head -1)
-if [ -n "$FIRST_ENC" ]; then
-    xxd "$FIRST_ENC" | head -8
-    ok "Confirmed: ciphertext in backing store (not plaintext)"
-else
-    echo "  (index.enc present; file blobs may be named by HMAC hash)"
-    ls "$BACKING/"
+echo "  In the backing directory (names are HMACs, contents are ciphertext):"
+find "$BACKING" -mindepth 1 -printf '    %f\n'
+BLOB=$(find "$BACKING" -name '*.enc' ! -name index.enc | head -1)
+od -A x -t x1z -N 64 "$BLOB" | sed "s/^/    /"
+if grep -rqa -e "secret" -e "report" "$BACKING"; then
+    fail "plaintext found in backing directory"
 fi
+ok "No plaintext names or contents in the backing directory"
 
-echo ""
-echo -e "${BOLD}  ── cloudcli_stub store (simulated cloud upload) ──${NC}"
-STUB_STORE="$HOME/.encfs_stub_store"
-if [ -d "$STUB_STORE" ]; then
-    echo "  Files in stub store (uploaded encrypted blobs):"
-    ls -lh "$STUB_STORE/"
-    ok "cloudcli_stub received uploads"
-else
-    echo "  (stub store not yet populated — uploads may be async)"
-fi
-
-# ── 6. Unmount & cleanup ──────────────────────────────────────
-banner "STEP 6 — Unmount"
 fusermount3 -u "$MOUNT"
-ok "Unmounted cleanly"
+wait "$FS_PID" || true
+FS_PID=""
+ok "Unmounted (pending uploads were flushed)"
 
-# Verify files are gone from mount but backing store still exists
-[ ! -f "$MOUNT/hello.txt" ] && ok "Mount point is empty after unmount"
-[ -d "$BACKING" ] && ok "Backing store preserved after unmount"
+echo "  Simulated cloud store:"
+find "$ENCFS_STUB_STORE" -mindepth 1 -printf '    %f\n'
 
-# ── 7. Summary ────────────────────────────────────────────────
-banner "ALL DONE"
+echo "  Recovering a file without mounting:"
+./build/decrypt_by_name -k "$KEY" "$BACKING" report.txt - | sed 's/^/    /'
+
+banner "All done"
 echo -e "${GREEN}${BOLD}  encfs-cloudcli built, tested, and demonstrated successfully.${NC}"
-echo ""
-echo "  Proof summary:"
-echo "    ✓ All unit tests (crypto, index) passed"
-echo "    ✓ All integration tests passed"
-echo "    ✓ FUSE mount/unmount works"
-echo "    ✓ Write → encrypted backing → read → plaintext roundtrip"
-echo "    ✓ Binary file roundtrip (byte-for-byte identical)"
-echo "    ✓ Multi-file readdir works"
-echo "    ✓ Overwrite and delete work"
-echo "    ✓ Backing store holds ciphertext (not plaintext)"
-echo ""
