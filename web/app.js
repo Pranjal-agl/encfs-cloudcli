@@ -316,7 +316,7 @@ async function unlock() {
   }
   $("#key-hex").value = "";
   $("#passphrase").value = "";
-  const files = vault.entries.filter((e) => !e.isDirectory).length;
+  const files = vault.entries.filter((e) => !e.isDirectory && !e.isSymlink).length;
   status.textContent += `Unlocked: ${files} file${files === 1 ? "" : "s"} in the index.`;
   renderFileList();
 }
@@ -336,6 +336,12 @@ function renderFileList() {
     if (entry.isDirectory) {
       nameCell.append(el("span", { class: "dir", text: `${base}/` }));
       tbody.append(el("tr", {}, nameCell, el("td"), el("td", { class: "when" }), el("td"), el("td")));
+      continue;
+    }
+    if (entry.isSymlink) {
+      nameCell.append(base, el("span", { class: "hint", text: ` → ${entry.target}` }));
+      tbody.append(el("tr", {}, nameCell, el("td"), el("td", { class: "when" }),
+                      el("td", {}, el("span", { class: "state missing", text: "Symbolic link" })), el("td")));
       continue;
     }
     nameCell.append(base);
@@ -401,7 +407,7 @@ async function verifyAll() {
   btn.disabled = true;
   let ok = 0, bad = 0, missing = 0;
   for (const entry of vault.entries) {
-    if (entry.isDirectory) continue;
+    if (entry.isDirectory || entry.isSymlink) continue;
     const res = await decryptEntry(entry);
     showResult(entry.stateNode, res);
     if (res.status === "ok") ok++; else if (res.status === "missing") missing++; else bad++;

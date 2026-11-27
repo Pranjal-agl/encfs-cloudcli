@@ -183,31 +183,144 @@ void TestUnicodeAndOddNames() {
     for (const auto& n : names) CHECK(reloaded.Exists(n));
 }
 
+FileMetadata Dir() {
+    FileMetadata m;
+    m.type = EntryType::kDirectory;
+    m.mode = 0755;
+    return m;
+}
+
 void TestDirectoryEntries() {
     TempDir dir;
     EncryptedIndex index(dir.path(), kKey);
-    FileMetadata d1, d2;  // directories: no remote ID
-    index.SetMetadata("docs", d1);
-    index.SetMetadata("docs/old", d2);
+    index.SetMetadata("docs", Dir());
+    index.SetMetadata("docs/old", Dir());
     index.SetMetadata("docs/a.txt", Meta("id-a", 1, 5));
-    CHECK(d1.IsDirectory());
-    CHECK(!Meta("x", 1, 0).IsDirectory());
 
-    // Directories don't occupy the reverse map, and removing one leaves the
-    // others (and files) alone.
-    std::string name;
-    CHECK(!index.GetPlaintextName("", name));
+    FileMetadata m;
+    CHECK(index.GetMetadata("docs", m) && m.IsDirectory() && m.remote_id.size() == 64);
+    CHECK(index.ListDirectory("docs") == std::vector<std::string>({"a.txt", "old"}));
+    CHECK(index.ListDirectory("") == std::vector<std::string>({"docs"}));
+    CHECK(index.HasChildren("docs") && !index.HasChildren("docs/old"));
+
     index.Remove("docs/old");
-    CHECK(index.Exists("docs"));
+    CHECK(index.ListDirectory("docs") == std::vector<std::string>({"a.txt"}));
+    std::string name;
     CHECK(index.GetPlaintextName("id-a", name) && name == "docs/a.txt");
 
     CHECK(index.Save());
     EncryptedIndex reloaded(dir.path(), kKey);
     CHECK(reloaded.Load());
+    CHECK(reloaded.GetMetadata("docs", m) && m.IsDirectory() && m.mode == 0755);
+    CHECK(reloaded.GetMetadata("docs/a.txt", m) && m.IsFile());
+    CHECK(reloaded.ListDirectory("docs") == std::vector<std::string>({"a.txt"}));
+}
+
+void TestHardLinks() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    index.SetMetadata("a", Meta("inode1", 3, 10));
+    CHECK(index.Link("a", "b"));
+    CHECK(!index.Link("a", "b"));       // already exists
+    CHECK(!index.Link("missing", "c"));
+
     FileMetadata m;
-    CHECK(reloaded.GetMetadata("docs", m) && m.IsDirectory());
-    CHECK(reloaded.GetMetadata("docs/a.txt", m) && !m.IsDirectory());
-    CHECK(!reloaded.GetPlaintextName("", name));
+    CHECK(index.GetMetadata("b", m) && m.remote_id == "inode1" && m.nlink == 2);
+
+    // Updating the inode through one name shows through the other.
+    m.size = 99;
+    CHECK(index.UpdateInode(m));
+    CHECK(index.GetMetadata("a", m) && m.size == 99 && m.nlink == 2);
+
+    CHECK(index.Save());
+    EncryptedIndex reloaded(dir.path(), kKey);
+    CHECK(reloaded.Load() && reloaded.GetMetadata("a", m) && m.nlink == 2);
+
+    // Only the last unlink removes the inode.
+    FileMetadata removed;
+    CHECK(!reloaded.Remove("a", &removed));
+    CHECK(reloaded.GetInode("inode1", m) && m.nlink == 1);
+    CHECK(reloaded.Remove("b", &removed) && removed.remote_id == "inode1");
+    CHECK(!reloaded.GetInode("inode1", m));
+
+    // No hard links to directories.
+    reloaded.SetMetadata("d", Dir());
+    CHECK(!reloaded.Link("d", "d2"));
+}
+
+void TestRenameMovesSubtree() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    index.SetMetadata("p", Dir());
+    index.SetMetadata("p/q", Dir());
+    index.SetMetadata("p/q/f", Meta("f-id", 1, 1));
+    index.SetMetadata("p/g", Meta("g-id", 1, 1));
+    index.SetMetadata("pz", Meta("pz-id", 1, 1));  // shares a prefix but isn't inside p
+
+    CHECK(!index.Rename("p", "p/q/inside"));  // into itself
+    CHECK(!index.Rename("p", "pz"));          // destination exists
+    CHECK(index.Rename("p", "r"));
+    FileMetadata m;
+    CHECK(!index.Exists("p") && !index.Exists("p/q/f") && !index.Exists("p/g"));
+    CHECK(index.GetMetadata("r/q/f", m) && m.remote_id == "f-id");  // same inode: no re-encryption
+    CHECK(index.GetMetadata("r/g", m) && m.remote_id == "g-id");
+    CHECK(index.GetMetadata("pz", m) && m.remote_id == "pz-id");   // untouched
+    CHECK(index.ListDirectory("") == std::vector<std::string>({"pz", "r"}));
+    CHECK(index.ListDirectory("r") == std::vector<std::string>({"g", "q"}));
+    CHECK(index.Descendants("r") == std::vector<std::string>({"r/g", "r/q", "r/q/f"}));
+}
+
+void TestSymlinksAndModesRoundTrip() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    FileMetadata link;
+    link.type = EntryType::kSymlink;
+    link.target = "../somewhere/else";
+    link.mode = 0777;
+    index.SetMetadata("ln", link);
+    FileMetadata exe = Meta("exe-id", 1, 4);
+    exe.mode = 04755;
+    index.SetMetadata("run.sh", exe);
+    const uint64_t gen = index.generation();
+    CHECK(index.Save() && index.generation() == gen + 1);
+
+    EncryptedIndex reloaded(dir.path(), kKey);
+    CHECK(reloaded.Load());
+    FileMetadata m;
+    CHECK(reloaded.GetMetadata("ln", m) && m.IsSymlink() && m.target == "../somewhere/else");
+    CHECK(reloaded.GetMetadata("run.sh", m) && m.mode == 04755);
+    CHECK(reloaded.generation() == gen + 1);
+}
+
+void TestV1IndexMigrates() {
+    // An index exactly as v1 wrote it: a directory with an empty ID and a file.
+    TempDir dir;
+    std::vector<uint8_t> plain;
+    AppendU32LE(plain, 2);
+    auto entry = [&](const std::string& name, const std::string& id) {
+        AppendU32LE(plain, static_cast<uint32_t>(name.size()));
+        plain.insert(plain.end(), name.begin(), name.end());
+        AppendU32LE(plain, static_cast<uint32_t>(id.size()));
+        plain.insert(plain.end(), id.begin(), id.end());
+        AppendU64LE(plain, 4);
+        AppendU64LE(plain, 7);
+        AppendU64LE(plain, 1700000000);
+    };
+    entry("docs", "");
+    entry("docs/x", std::string(64, 'a'));
+    auto index_key = KeyManager::DeriveSubkey(kKey, "encfs_index_key_derivation");
+    CHECK(WriteFileAtomic(dir / "index.enc", SimpleCrypto::Encrypt(plain, index_key)));
+
+    EncryptedIndex index(dir.path(), kKey);
+    CHECK(index.Load());
+    FileMetadata m;
+    CHECK(index.GetMetadata("docs", m) && m.IsDirectory() && m.remote_id.size() == 64);
+    CHECK(index.GetMetadata("docs/x", m) && m.IsFile() && m.remote_id == std::string(64, 'a') &&
+          m.version == 4 && m.size == 7 && m.mode == 0644);
+    CHECK(index.ListDirectory("docs") == std::vector<std::string>({"x"}));
+    CHECK(index.Save());  // rewritten as v2
+    EncryptedIndex again(dir.path(), kKey);
+    CHECK(again.Load() && again.Exists("docs/x"));
 }
 
 } // namespace
@@ -222,6 +335,10 @@ int main() {
         {"Corrupt or malformed index rejected", TestCorruptIndexRejected},
         {"On-disk format is stable", TestOnDiskFormatIsStable},
         {"Unicode and unusual filenames", TestUnicodeAndOddNames},
-        {"Directory entries", TestDirectoryEntries},
+        {"Directory entries and listings", TestDirectoryEntries},
+        {"Hard links share an inode", TestHardLinks},
+        {"Rename moves a whole subtree, index-only", TestRenameMovesSubtree},
+        {"Symlinks, modes and generation round-trip", TestSymlinksAndModesRoundTrip},
+        {"v1 indexes are read and migrated", TestV1IndexMigrates},
     });
 }

@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <iostream>
+#include <map>
 #include <set>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -116,9 +117,9 @@ int Verify(Context& ctx, EncryptedIndex& index) {
     for (const auto& name : names) {
         FileMetadata meta;
         index.GetMetadata(name, meta);
-        if (meta.IsDirectory()) continue;
+        if (!meta.IsFile()) continue;
+        if (!referenced.insert(meta.remote_id + ".enc").second) continue;  // hard link: checked already
         ++files;
-        referenced.insert(meta.remote_id + ".enc");
         std::vector<uint8_t> plaintext;
         Outcome o = Decrypt(ctx, meta, plaintext);
         if (o == Outcome::kOk && plaintext.size() != meta.size) o = Outcome::kCorrupt;
@@ -195,6 +196,8 @@ int ExtractAll(Context& ctx, EncryptedIndex& index, const std::string& out_dir) 
     std::sort(names.begin(), names.end());
     size_t written = 0, failed = 0;
     std::vector<std::pair<std::string, int64_t>> dir_times;
+    std::vector<std::pair<std::string, uint32_t>> dir_modes;
+    std::map<std::string, std::string> extracted;  // inode → first path written (for hard links)
 
     for (const auto& name : names) {
         FileMetadata meta;
@@ -212,6 +215,22 @@ int ExtractAll(Context& ctx, EncryptedIndex& index, const std::string& out_dir) 
         if (meta.IsDirectory()) {
             ::mkdir(dest.c_str(), 0700);
             dir_times.emplace_back(dest, meta.mtime);
+            dir_modes.emplace_back(dest, meta.mode);
+            continue;
+        }
+        if (meta.IsSymlink()) {
+            if (::symlink(meta.target.c_str(), dest.c_str()) != 0) {
+                std::cerr << "cannot create symlink " << dest << ": " << std::strerror(errno) << "\n";
+                ++failed;
+            }
+            continue;
+        }
+        auto first = extracted.find(meta.remote_id);
+        if (first != extracted.end()) {  // another name for a file already written
+            if (::link(first->second.c_str(), dest.c_str()) != 0) {
+                std::cerr << "cannot create hard link " << dest << ": " << std::strerror(errno) << "\n";
+                ++failed;
+            }
             continue;
         }
         std::vector<uint8_t> plaintext;
@@ -225,12 +244,18 @@ int ExtractAll(Context& ctx, EncryptedIndex& index, const std::string& out_dir) 
             std::cerr << "cannot write " << dest << ": " << std::strerror(errno) << "\n";
             ++failed;
         } else {
+            ::chmod(dest.c_str(), static_cast<mode_t>(meta.mode));
             SetMtime(dest, meta.mtime);
+            extracted[meta.remote_id] = dest;
             ++written;
         }
         SecureWipe(plaintext);
     }
-    // Directory times last (deepest first): writing into a directory updates its mtime.
+    // Directory modes and times last (deepest first): writing into a directory
+    // updates its mtime, and a read-only mode would stop us writing into it.
+    for (auto it = dir_modes.rbegin(); it != dir_modes.rend(); ++it) {
+        ::chmod(it->first.c_str(), static_cast<mode_t>(it->second));
+    }
     for (auto it = dir_times.rbegin(); it != dir_times.rend(); ++it) SetMtime(it->first, it->second);
 
     std::cerr << "Extracted " << written << " file(s) to " << out_dir;
@@ -308,6 +333,8 @@ int main(int argc, char* argv[]) {
             index.GetMetadata(name, meta);
             if (meta.IsDirectory()) {
                 std::cout << "-\t" << name << "/\n";
+            } else if (meta.IsSymlink()) {
+                std::cout << "-\t" << name << " -> " << meta.target << "\n";
             } else {
                 std::cout << meta.size << "\t" << name << "\n";
             }
@@ -331,6 +358,10 @@ int main(int argc, char* argv[]) {
     }
     if (meta.IsDirectory()) {
         std::cerr << plaintext_name << " is a directory (use --extract-all for everything)\n";
+        return 1;
+    }
+    if (meta.IsSymlink()) {
+        std::cerr << plaintext_name << " is a symbolic link to " << meta.target << "\n";
         return 1;
     }
 

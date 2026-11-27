@@ -68,9 +68,8 @@ const char kCloudKdfId[] = "encfs.kdf";
 // shares one OpenFile, so concurrent readers/writers see a consistent view.
 struct OpenFile {
     std::mutex mu;
-    // Changed only by rename, which holds both the namespace lock and `mu`.
-    std::string name;
-    std::string remote_id;
+    std::string name;       // a path it was opened by (for log messages only)
+    std::string remote_id;  // inode ID: the key in open_files, never changes
     // Guarded by `mu`. Chunk-level view of the contents (null until first
     // needed); bounded memory whatever the file's size.
     std::unique_ptr<FileContents> contents;
@@ -96,7 +95,9 @@ struct Context {
     std::unique_ptr<EncryptedIndex> index;
     std::unique_ptr<CloudCLIWrapper> cloud;
 
-    std::unordered_map<std::string, std::shared_ptr<OpenFile>> open_files;  // by name
+    // By inode ID, so every path to a hard-linked file shares one OpenFile
+    // and renames don't affect open files.
+    std::unordered_map<std::string, std::shared_ptr<OpenFile>> open_files;
     std::unordered_map<uint64_t, Handle> handles;
     uint64_t next_fh = 1;
 
@@ -192,20 +193,6 @@ int CheckParent(const std::string& name) {
     return meta.IsDirectory() ? 0 : -ENOTDIR;
 }
 
-// Every index entry strictly below directory `dir` ("" = root), sorted so
-// that parents come before their children.
-std::vector<std::string> DescendantsOf(const std::string& dir) {
-    const std::string prefix = dir.empty() ? "" : dir + "/";
-    std::vector<std::string> out;
-    for (auto& name : g_ctx->index->GetAllPlaintextNames()) {
-        if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0) {
-            out.push_back(std::move(name));
-        }
-    }
-    std::sort(out.begin(), out.end());
-    return out;
-}
-
 std::string BlobPath(const std::string& remote_id) {
     return g_ctx->backing_dir + "/" + remote_id + ".enc";
 }
@@ -220,7 +207,7 @@ int DecryptBlob(const std::string& name, FileMetadata meta,
         if (actual != meta.version) {
             meta.version = actual;
             meta.size = out.size();
-            g_ctx->index->SetMetadata(name, meta);
+            g_ctx->index->UpdateInode(meta);
             SaveIndex();
         }
         return 0;
@@ -253,7 +240,7 @@ void Publish(OpenFile& file) {
 int OpenContents(OpenFile& file) {
     if (file.contents) return 0;
     FileMetadata meta;
-    if (!g_ctx->index->GetMetadata(file.name, meta)) return -ENOENT;
+    if (!g_ctx->index->GetInode(file.remote_id, meta)) return -ENOENT;
 
     const std::string path = BlobPath(meta.remote_id);
     std::string source = path;
@@ -292,7 +279,7 @@ int OpenContents(OpenFile& file) {
             // Blob is one version ahead (crash before the index was saved).
             meta.version = actual;
             meta.size = reader->plaintext_size();
-            g_ctx->index->SetMetadata(file.name, meta);
+            g_ctx->index->UpdateInode(meta);
             SaveIndex();
             file.contents = NewContents(std::move(reader));
         } else if (reader->plaintext_size() != meta.size) {
@@ -318,7 +305,7 @@ int OpenContents(OpenFile& file) {
         if (rc == 0 && ::rename(source.c_str(), path.c_str()) == 0) {
             // Verified, so the cloud holds exactly this version.
             FileMetadata now;
-            if (g_ctx->index->GetMetadata(file.name, now)) MarkSynced(now.remote_id, now.version);
+            if (g_ctx->index->GetInode(file.remote_id, now)) MarkSynced(now.remote_id, now.version);
             g_ctx->cache_check_pending = true;  // can't take the namespace lock here
         } else {
             ::unlink(source.c_str());
@@ -344,7 +331,7 @@ void ResetContents(OpenFile& file) {
 
 // Caller holds the namespace lock.
 std::shared_ptr<OpenFile> Acquire(const std::string& name, const FileMetadata& meta) {
-    auto it = g_ctx->open_files.find(name);
+    auto it = g_ctx->open_files.find(meta.remote_id);
     if (it != g_ctx->open_files.end() && !it->second->deleted) {
         it->second->refs++;
         return it->second;
@@ -354,14 +341,14 @@ std::shared_ptr<OpenFile> Acquire(const std::string& name, const FileMetadata& m
     file->remote_id = meta.remote_id;
     file->mtime = meta.mtime;
     file->refs = 1;
-    g_ctx->open_files[name] = file;
+    g_ctx->open_files[meta.remote_id] = file;
     return file;
 }
 
 // Caller holds the namespace lock (and not file->mu).
 void ReleaseRef(const std::shared_ptr<OpenFile>& file) {
     if (--file->refs > 0) return;
-    auto it = g_ctx->open_files.find(file->name);
+    auto it = g_ctx->open_files.find(file->remote_id);
     if (it != g_ctx->open_files.end() && it->second == file) {
         g_ctx->open_files.erase(it);
     }
@@ -378,7 +365,7 @@ int Persist(OpenFile& file) {
     if (int rc = OpenContents(file)) return rc;
 
     FileMetadata meta;
-    if (!g_ctx->index->GetMetadata(file.name, meta)) return 0;  // removed meanwhile
+    if (!g_ctx->index->GetInode(file.remote_id, meta)) return 0;  // removed meanwhile
 
     const uint64_t version = meta.version + 1;
     const std::string path = BlobPath(file.remote_id);
@@ -414,7 +401,7 @@ int Persist(OpenFile& file) {
     meta.version = version;
     meta.size = file.contents->size();
     meta.mtime = file.mtime.load();
-    g_ctx->index->SetMetadata(file.name, meta);
+    g_ctx->index->UpdateInode(meta);
     if (int rc = SaveIndex()) {
         // The blob is now one version ahead of the saved index; reads accept
         // and repair that.
@@ -428,29 +415,48 @@ int Persist(OpenFile& file) {
     return 0;
 }
 
-// Remove a file's index entry, local blob and (in the background) cloud copy.
+// Unlink a path. If it was the inode's last link, the blob goes too (locally
+// now, in the cloud in the background); open handles keep their view.
 // Caller holds the namespace lock.
-void RemoveFile(const std::string& name, const FileMetadata& meta) {
-    auto open = g_ctx->open_files.find(name);
-    if (open != g_ctx->open_files.end()) {
-        // Taking the file lock waits out a save in progress, so it can't
-        // write the file back after we've removed it.
-        std::lock_guard<std::mutex> file_lock(open->second->mu);
-        open->second->deleted = true;  // open handles keep their in-memory view
+void RemovePath(const std::string& name) {
+    FileMetadata removed;
+    if (!g_ctx->index->Remove(name, &removed)) {
+        SaveIndex();  // just one of several links: the inode lives on
+        return;
     }
-    g_ctx->index->Remove(name);
+    if (removed.IsFile()) {
+        auto open = g_ctx->open_files.find(removed.remote_id);
+        if (open != g_ctx->open_files.end()) {
+            // Taking the file lock waits out a save in progress, so it can't
+            // write the file back after we've removed it.
+            std::lock_guard<std::mutex> file_lock(open->second->mu);
+            open->second->deleted = true;
+            g_ctx->open_files.erase(open);
+        }
+    }
     SaveIndex();
-    Unsync(meta.remote_id);
-    ::unlink(BlobPath(meta.remote_id).c_str());
-    g_ctx->cloud->QueueDelete(meta.remote_id);
-
-    if (open != g_ctx->open_files.end()) g_ctx->open_files.erase(open);
+    if (removed.IsFile()) {
+        Unsync(removed.remote_id);
+        ::unlink(BlobPath(removed.remote_id).c_str());
+        g_ctx->cloud->QueueDelete(removed.remote_id);
+    }
 }
 
 Handle* FindHandle(struct fuse_file_info* fi) {
     if (!fi) return nullptr;
     auto it = g_ctx->handles.find(fi->fh);
     return it == g_ctx->handles.end() ? nullptr : &it->second;
+}
+
+// st_ino for an inode: the first 64 bits of its (random or HMAC) ID. 1 is
+// the root's.
+ino_t InodeNumber(const std::string& remote_id) {
+    uint64_t n = 0;
+    for (size_t i = 0; i < 16 && i < remote_id.size(); ++i) {
+        char c = remote_id[i];
+        n = (n << 4) | static_cast<uint64_t>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+    }
+    return static_cast<ino_t>(n <= 1 ? n + 2 : n);
 }
 
 int64_t Now() {
@@ -590,12 +596,10 @@ void EnforceCacheLimit() {
     });
     for (const auto& blob : blobs) {
         if (total <= g_ctx->cache_limit) break;
-        std::string name;
         FileMetadata meta;
         uint64_t synced_version = 0;
         if (!SyncedVersion(blob.id, &synced_version) || open_ids.count(blob.id) ||
-            !g_ctx->index->GetPlaintextName(blob.id, name) ||
-            !g_ctx->index->GetMetadata(name, meta) || meta.version != synced_version ||
+            !g_ctx->index->GetInode(blob.id, meta) || meta.version != synced_version ||
             g_ctx->cloud->IsPending(blob.id)) {
             continue;  // not provably safe in the cloud
         }
@@ -616,9 +620,8 @@ void MaybeEnforceCacheLimit() {
 void OnUploaded(const std::string& id) {
     if (id.size() != 64) return;  // index / KDF objects
     std::lock_guard<std::mutex> lock(g_ctx->mutex);
-    std::string name;
     FileMetadata meta;
-    if (!g_ctx->index->GetPlaintextName(id, name) || !g_ctx->index->GetMetadata(name, meta)) return;
+    if (!g_ctx->index->GetInode(id, meta)) return;
     // If another save is already queued, the cloud may still lag behind.
     if (g_ctx->cloud->IsPending(id)) return;
     MarkSynced(id, meta.version);
@@ -630,9 +633,8 @@ void OnUploaded(const std::string& id) {
 // current version (e.g. an upload lost in a crash), and forget stale records.
 void ReconcileWithCloud() {
     std::unordered_set<std::string> live;
-    for (const auto& name : g_ctx->index->GetAllPlaintextNames()) {
-        FileMetadata meta;
-        if (!g_ctx->index->GetMetadata(name, meta) || meta.IsDirectory()) continue;
+    for (const FileMetadata& meta : g_ctx->index->AllInodes()) {
+        if (!meta.IsFile()) continue;
         live.insert(meta.remote_id);
         uint64_t synced_version = 0;
         const std::string path = BlobPath(meta.remote_id);
@@ -674,7 +676,14 @@ uint64_t ParseSize(const std::string& text) {
 
 void* encfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     (void)conn;
-    (void)cfg;
+    // Report our own inode numbers (from the inode ID), so hard links share
+    // st_ino and tools like `cp -a`, `rsync -H` and `tar` recognise them.
+    cfg->use_ino = 1;
+    // The high-level API gives every *path* its own kernel node, so the
+    // kernel can't know two names are one file. Don't let it cache attributes,
+    // or a write or link through one name would leave another's size and link
+    // count stale. getattr is an in-memory lookup, so this is cheap.
+    cfg->attr_timeout = 0;
     // Started here rather than in main(): with --background, fuse_main forks
     // before calling init, and threads don't survive a fork.
     g_ctx->cloud->StartBackgroundUploader();
@@ -711,6 +720,7 @@ int encfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) 
         if (std::strcmp(path, "/") == 0) {
             st->st_mode = S_IFDIR | 0755;
             st->st_nlink = 2;
+            st->st_ino = 1;
             st->st_mtime = st->st_ctime = st->st_atime = g_ctx->mount_time;
             return 0;
         }
@@ -720,23 +730,30 @@ int encfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) 
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
 
+        st->st_ino = InodeNumber(meta.remote_id);
+        st->st_mtime = st->st_ctime = st->st_atime = static_cast<time_t>(meta.mtime);
         if (meta.IsDirectory()) {
-            st->st_mode = S_IFDIR | 0755;
+            st->st_mode = S_IFDIR | meta.mode;
             st->st_nlink = 2;
-            st->st_mtime = st->st_ctime = st->st_atime = static_cast<time_t>(meta.mtime);
+            return 0;
+        }
+        if (meta.IsSymlink()) {
+            st->st_mode = S_IFLNK | 0777;
+            st->st_nlink = 1;
+            st->st_size = static_cast<off_t>(meta.target.size());
             return 0;
         }
 
         uint64_t size = meta.size;
         int64_t mtime = meta.mtime;
-        auto it = g_ctx->open_files.find(name);
+        auto it = g_ctx->open_files.find(meta.remote_id);
         if (it != g_ctx->open_files.end() && it->second->loaded) {
             size = it->second->size_hint;  // reflect unsaved writes
             mtime = it->second->mtime;
         }
 
-        st->st_mode = S_IFREG | 0644;
-        st->st_nlink = 1;
+        st->st_mode = S_IFREG | meta.mode;
+        st->st_nlink = meta.nlink;
         st->st_size = static_cast<off_t>(size);
         st->st_blocks = static_cast<blkcnt_t>((size + 511) / 512);
         st->st_mtime = st->st_ctime = st->st_atime = static_cast<time_t>(mtime);
@@ -760,10 +777,8 @@ int encfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t off
         }
         filler(buf, ".", nullptr, 0, fuse_fill_dir_flags(0));
         filler(buf, "..", nullptr, 0, fuse_fill_dir_flags(0));
-        const size_t skip = dir.empty() ? 0 : dir.size() + 1;
-        for (const auto& name : DescendantsOf(dir)) {
-            if (name.find('/', skip) != std::string::npos) continue;  // not a direct child
-            filler(buf, name.c_str() + skip, nullptr, 0, fuse_fill_dir_flags(0));
+        for (const auto& child : g_ctx->index->ListDirectory(dir)) {
+            filler(buf, child.c_str(), nullptr, 0, fuse_fill_dir_flags(0));
         }
         return 0;
     });
@@ -797,6 +812,7 @@ int encfs_open(const char* path, struct fuse_file_info* fi) {
             FileMetadata meta;
             if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
             if (meta.IsDirectory()) return -EISDIR;
+            if (meta.IsSymlink()) return -ELOOP;
             if (writable && g_ctx->read_only) return -EROFS;
             file = Acquire(name, meta);
         }
@@ -828,7 +844,6 @@ int encfs_open(const char* path, struct fuse_file_info* fi) {
 }
 
 int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-    (void)mode;
     return Guarded("create", [&]() -> int {
         // Namespace change: hold the namespace lock throughout.
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
@@ -841,9 +856,11 @@ int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
         const bool existed = g_ctx->index->GetMetadata(name, meta);
         if (existed && (fi->flags & O_EXCL)) return -EEXIST;
         if (existed && meta.IsDirectory()) return -EISDIR;
+        if (existed && meta.IsSymlink()) return -ELOOP;
         if (!existed) {
             meta = FileMetadata();
-            meta.remote_id = g_ctx->codec->RemoteIdFor(name);
+            meta.remote_id = NewInodeId();  // random: unrelated to the path
+            meta.mode = mode & 07777;
             meta.mtime = Now();
             g_ctx->index->SetMetadata(name, meta);
             if (int rc = SaveIndex()) {
@@ -939,6 +956,7 @@ int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
                 FileMetadata meta;
                 if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
                 if (meta.IsDirectory()) return -EISDIR;
+                if (!meta.IsFile()) return -EINVAL;
                 file = Acquire(name, meta);
                 temporary = true;
             }
@@ -1032,13 +1050,12 @@ int encfs_unlink(const char* path) {
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
         if (meta.IsDirectory()) return -EISDIR;
-        RemoveFile(name, meta);
+        RemovePath(name);
         return 0;
     });
 }
 
 int encfs_mkdir(const char* path, mode_t mode) {
-    (void)mode;
     return Guarded("mkdir", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
         if (g_ctx->read_only) return -EROFS;
@@ -1047,7 +1064,10 @@ int encfs_mkdir(const char* path, mode_t mode) {
         if (int rc = CheckParent(name)) return rc;
         if (g_ctx->index->Exists(name)) return -EEXIST;
 
-        FileMetadata meta;  // empty remote_id = directory
+        FileMetadata meta;
+        meta.remote_id = NewInodeId();
+        meta.type = EntryType::kDirectory;
+        meta.mode = mode & 07777;
         meta.mtime = Now();
         g_ctx->index->SetMetadata(name, meta);
         if (int rc = SaveIndex()) {
@@ -1067,86 +1087,21 @@ int encfs_rmdir(const char* path) {
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
         if (!meta.IsDirectory()) return -ENOTDIR;
-        if (!DescendantsOf(name).empty()) return -ENOTEMPTY;
+        if (g_ctx->index->HasChildren(name)) return -ENOTEMPTY;
         g_ctx->index->Remove(name);
         return SaveIndex();
     });
 }
 
-// Move one file from `src` to `dst` (which must be free). Remote IDs are
-// derived from the path and every blob is bound to its ID, so the contents are
-// re-encrypted under the new ID and the old blob is removed.
-int MoveFile(const std::string& src, const FileMetadata& src_meta, const std::string& dst) {
-    auto file = Acquire(src, src_meta);
-    std::unique_lock<std::mutex> file_lock(file->mu);  // waits out a save in progress
-    if (int rc = OpenContents(*file)) {
-        file_lock.unlock();
-        ReleaseRef(file);
-        return rc;
-    }
-
-    const std::string old_id = file->remote_id;
-    FileMetadata new_meta = src_meta;
-    new_meta.remote_id = g_ctx->codec->RemoteIdFor(dst);
-
-    g_ctx->index->Remove(src);
-    g_ctx->index->SetMetadata(dst, new_meta);
-    g_ctx->open_files.erase(src);
-    file->name = dst;
-    file->remote_id = new_meta.remote_id;
-    file->dirty = true;
-    g_ctx->open_files[dst] = file;
-
-    int rc = Persist(*file);
-    if (rc != 0) {
-        // Undo the in-memory move so the source is still intact.
-        g_ctx->index->Remove(dst);
-        g_ctx->index->SetMetadata(src, src_meta);
-        SaveIndex();
-        g_ctx->open_files.erase(dst);
-        file->name = src;
-        file->remote_id = old_id;
-        g_ctx->open_files[src] = file;
-    } else {
-        Unsync(old_id);
-        ::unlink(BlobPath(old_id).c_str());
-        g_ctx->cloud->QueueDelete(old_id);
-    }
-    file_lock.unlock();
-    ReleaseRef(file);
-    return rc;
-}
-
-// Move a directory and everything below it. Each file is re-encrypted under
-// its new path, so this costs time proportional to the subtree's size.
-int MoveDirectory(const std::string& src, const FileMetadata& src_meta, const std::string& dst) {
-    const std::vector<std::string> descendants = DescendantsOf(src);
-
-    g_ctx->index->SetMetadata(dst, src_meta);
-    for (const auto& old_name : descendants) {
-        const std::string new_name = dst + old_name.substr(src.size());
-        FileMetadata meta;
-        if (!g_ctx->index->GetMetadata(old_name, meta)) continue;
-        if (meta.IsDirectory()) {
-            g_ctx->index->Remove(old_name);
-            g_ctx->index->SetMetadata(new_name, meta);
-        } else if (int rc = MoveFile(old_name, meta, new_name)) {
-            // Partially moved: leave both trees in place (nothing is lost) and
-            // report the failure.
-            Log("rename '" + src + "' -> '" + dst + "' stopped at '" + old_name + "'");
-            SaveIndex();
-            return rc;
-        }
-    }
-    g_ctx->index->Remove(src);
-    return SaveIndex();
-}
-
+// Renames only edit the index: inode IDs are random and unrelated to paths,
+// so no data moves, a directory of any size moves in one step, and the
+// change is atomic (one index save). Open files are keyed by inode, so they
+// are unaffected.
 int encfs_rename(const char* from, const char* to, unsigned int flags) {
     return Guarded("rename", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
         if (g_ctx->read_only) return -EROFS;
-        if (flags & RENAME_EXCHANGE) return -EINVAL;
+        if ((flags & RENAME_EXCHANGE) && (flags & RENAME_NOREPLACE)) return -EINVAL;
 
         std::string src, dst;
         if (int rc = NameFromPath(from, src)) return rc;
@@ -1154,30 +1109,98 @@ int encfs_rename(const char* from, const char* to, unsigned int flags) {
 
         FileMetadata src_meta, dst_meta;
         if (!g_ctx->index->GetMetadata(src, src_meta)) return -ENOENT;
-        if (src == dst) return 0;
         if (int rc = CheckParent(dst)) return rc;
+        if (dst.compare(0, src.size() + 1, src + "/") == 0) return -EINVAL;  // into itself
         const bool dst_exists = g_ctx->index->GetMetadata(dst, dst_meta);
-        if (dst_exists && (flags & RENAME_NOREPLACE)) return -EEXIST;
 
-        if (src_meta.IsDirectory()) {
-            if (dst.compare(0, src.size() + 1, src + "/") == 0) return -EINVAL;  // into itself
-            if (dst_exists) {
-                if (!dst_meta.IsDirectory()) return -ENOTDIR;
-                if (!DescendantsOf(dst).empty()) return -ENOTEMPTY;
-                g_ctx->index->Remove(dst);
+        if (flags & RENAME_EXCHANGE) {
+            if (!dst_exists) return -ENOENT;
+            if (src.compare(0, dst.size() + 1, dst + "/") == 0) return -EINVAL;
+            if (src == dst) return 0;
+            // Swap through a name no real path can have.
+            const std::string tmp = src + std::string(1, '\x01') + "exchange";
+            if (!g_ctx->index->Rename(src, tmp) || !g_ctx->index->Rename(dst, src) ||
+                !g_ctx->index->Rename(tmp, dst)) {
+                return -EIO;
             }
-            int rc = MoveDirectory(src, src_meta, dst);
-            EnforceCacheLimit();
-            return rc;
+            return SaveIndex();
         }
 
+        if (src == dst) return 0;
         if (dst_exists) {
-            if (dst_meta.IsDirectory()) return -EISDIR;
-            RemoveFile(dst, dst_meta);
+            if (flags & RENAME_NOREPLACE) return -EEXIST;
+            if (dst_meta.remote_id == src_meta.remote_id) return 0;  // hard links to one inode
+            if (src_meta.IsDirectory()) {
+                if (!dst_meta.IsDirectory()) return -ENOTDIR;
+                if (g_ctx->index->HasChildren(dst)) return -ENOTEMPTY;
+                g_ctx->index->Remove(dst);
+            } else {
+                if (dst_meta.IsDirectory()) return -EISDIR;
+                RemovePath(dst);
+            }
         }
-        int rc = MoveFile(src, src_meta, dst);
+        if (!g_ctx->index->Rename(src, dst)) return -EIO;
+        int rc = SaveIndex();
         EnforceCacheLimit();
         return rc;
+    });
+}
+
+int encfs_link(const char* from, const char* to) {
+    return Guarded("link", [&]() -> int {
+        std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
+        std::string src, dst;
+        if (int rc = NameFromPath(from, src)) return rc;
+        if (int rc = NameFromPath(to, dst)) return rc;
+        FileMetadata meta;
+        if (!g_ctx->index->GetMetadata(src, meta)) return -ENOENT;
+        if (!meta.IsFile()) return -EPERM;  // no hard links to directories or symlinks
+        if (int rc = CheckParent(dst)) return rc;
+        if (g_ctx->index->Exists(dst)) return -EEXIST;
+        if (!g_ctx->index->Link(src, dst)) return -EIO;
+        return SaveIndex();
+    });
+}
+
+int encfs_symlink(const char* target, const char* link_path) {
+    return Guarded("symlink", [&]() -> int {
+        std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
+        std::string name;
+        if (int rc = NameFromPath(link_path, name)) return rc;
+        if (int rc = CheckParent(name)) return rc;
+        if (g_ctx->index->Exists(name)) return -EEXIST;
+        if (std::strlen(target) >= PATH_MAX) return -ENAMETOOLONG;
+        FileMetadata meta;
+        meta.remote_id = NewInodeId();
+        meta.type = EntryType::kSymlink;
+        meta.mode = 0777;
+        meta.target = target;
+        meta.size = meta.target.size();
+        meta.mtime = Now();
+        g_ctx->index->SetMetadata(name, meta);
+        if (int rc = SaveIndex()) {
+            g_ctx->index->Remove(name);
+            return rc;
+        }
+        return 0;
+    });
+}
+
+int encfs_readlink(const char* path, char* buf, size_t size) {
+    return Guarded("readlink", [&]() -> int {
+        if (size == 0) return -EINVAL;
+        std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        std::string name;
+        if (int rc = NameFromPath(path, name)) return rc;
+        FileMetadata meta;
+        if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+        if (!meta.IsSymlink()) return -EINVAL;
+        size_t n = std::min(size - 1, meta.target.size());  // FUSE wants it NUL-terminated
+        std::memcpy(buf, meta.target.data(), n);
+        buf[n] = '\0';
+        return 0;
     });
 }
 
@@ -1200,31 +1223,48 @@ int encfs_utimens(const char* path, const struct timespec tv[2], struct fuse_fil
             return 0;
         }
 
-        g_ctx->index->SetMetadata(name, meta);
-        auto it = g_ctx->open_files.find(name);
+        g_ctx->index->UpdateInode(meta);
+        auto it = g_ctx->open_files.find(meta.remote_id);
         if (it != g_ctx->open_files.end()) it->second->mtime = meta.mtime;
         return SaveIndex();
     });
 }
 
-// Permissions and ownership aren't stored (everything belongs to the mounting
-// user). Accept the calls so tools like `cp -p` and `rsync -a` work.
+// Permission bits are stored per inode (and enforced by the kernel via
+// default_permissions). Ownership isn't: everything belongs to the mounting
+// user.
 int encfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
-    (void)mode;
     (void)fi;
     return Guarded("chmod", [&]() -> int {
         if (std::strcmp(path, "/") == 0) return 0;
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
         std::string name;
         if (int rc = NameFromPath(path, name)) return rc;
-        return g_ctx->index->Exists(name) ? 0 : -ENOENT;
+        FileMetadata meta;
+        if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+        if (meta.IsSymlink()) return 0;
+        meta.mode = mode & 07777;
+        g_ctx->index->UpdateInode(meta);
+        return SaveIndex();
     });
 }
 
 int encfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi) {
-    (void)uid;
-    (void)gid;
-    return encfs_chmod(path, 0, fi);
+    (void)fi;
+    return Guarded("chown", [&]() -> int {
+        std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (std::strcmp(path, "/") != 0) {
+            std::string name;
+            if (int rc = NameFromPath(path, name)) return rc;
+            if (!g_ctx->index->Exists(name)) return -ENOENT;
+        }
+        // Ownership isn't stored; accepting (and ignoring) the change keeps
+        // tools like `cp -p` and `rsync -a` (even as root) working.
+        (void)uid;
+        (void)gid;
+        return 0;
+    });
 }
 
 int encfs_statfs(const char* path, struct statvfs* st) {
@@ -1250,6 +1290,9 @@ struct fuse_operations MakeOperations() {
     ops.fsync = encfs_fsync;
     ops.release = encfs_release;
     ops.unlink = encfs_unlink;
+    ops.link = encfs_link;
+    ops.symlink = encfs_symlink;
+    ops.readlink = encfs_readlink;
     ops.mkdir = encfs_mkdir;
     ops.rmdir = encfs_rmdir;
     ops.rename = encfs_rename;
@@ -1433,7 +1476,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::vector<std::string> fuse_args = {argv[0], mount_point,
-                                          "-o", "fsname=encfs-cloudcli,subtype=encfs"};
+                                          "-o", "fsname=encfs-cloudcli,subtype=encfs,default_permissions"};
     if (!background) fuse_args.push_back("-f");
     if (debug) fuse_args.push_back("-d");
     for (int i = extra_start; i < argc; ++i) fuse_args.push_back(argv[i]);

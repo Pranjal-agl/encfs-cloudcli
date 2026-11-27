@@ -100,9 +100,22 @@ int Gen(const std::string& dir) {
     add("rolled.txt", Bytes("stale copy"), 6, 4, "rollback");
 
     FileMetadata dir_meta;
+    dir_meta.type = EntryType::kDirectory;
+    dir_meta.mode = 0750;
     dir_meta.mtime = 1700000100;
     index.SetMetadata("docs", dir_meta);
     expected << "docs\tdir\t\n";
+
+    FileMetadata link;
+    link.type = EntryType::kSymlink;
+    link.target = "docs/big.bin";
+    index.SetMetadata("shortcut", link);
+    expected << "shortcut\tsymlink\t" << HexEncode(reinterpret_cast<const uint8_t*>(link.target.data()),
+                                                    link.target.size()) << "\n";
+
+    index.Link("hello.txt", "docs/hello-again.txt");  // hard link: same blob
+    expected << "docs/hello-again.txt\tok\t" << HexEncode(reinterpret_cast<const uint8_t*>("Hello from C++"), 14)
+             << "\n";
 
     // A blob that's authentic but belongs to another file.
     FileMetadata swapped;
@@ -182,11 +195,16 @@ int Verify(const std::string& dir) {
     }
 
     EncryptedIndex index(dir + "/js", master);
-    bool index_ok = index.Load() && index.Size() == names.size();
+    bool index_ok = index.Load() && index.Size() == names.size() + 3;
     for (const auto& n : names) {
         FileMetadata m;
         index_ok = index_ok && index.GetMetadata(n, m) && m.remote_id == codec.RemoteIdFor(n);
     }
+    FileMetadata d, l, h, one;
+    index_ok = index_ok && index.GetMetadata("js/dir", d) && d.IsDirectory() && d.mode == 0750 &&
+               index.GetMetadata("js/link", l) && l.IsSymlink() && l.target == "../elsewhere" &&
+               index.GetMetadata("js/one-hardlink", h) && index.GetMetadata("js/one", one) &&
+               h.remote_id == one.remote_id && h.nlink == 2;
     std::cout << (index_ok ? "  ✓ " : "  ✗ ") << "C++ loads the JS-written index\n";
     if (!index_ok) ++failed;
 

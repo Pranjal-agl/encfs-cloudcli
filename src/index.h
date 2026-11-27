@@ -2,68 +2,120 @@
 
 #include <cstdint>
 #include <ctime>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace encfs {
 
+enum class EntryType : uint8_t { kFile = 1, kDirectory = 2, kSymlink = 3 };
+
+// One inode: the object a path refers to. Several paths can share a file
+// inode (hard links).
 struct FileMetadata {
+    // Opaque inode ID (64 hex chars). For files it is also the blob's name in
+    // the backing directory and the cloud, and is bound into the blob's AAD.
+    // New inodes get random IDs, so paths and IDs are unrelated.
     std::string remote_id;
-    uint64_t version;  // bumped on every write; bound into the blob for rollback detection
-    uint64_t size;
-    int64_t mtime;
+    EntryType type = EntryType::kFile;
+    uint64_t version = 1;  // bumped on every write; bound into the blob for rollback detection
+    uint64_t size = 0;
+    int64_t mtime = 0;
+    uint32_t mode = 0644;  // permission bits only
+    uint32_t nlink = 1;    // number of paths referring to this inode (maintained by the index)
+    std::string target;    // symlink target
 
-    FileMetadata() : version(1), size(0), mtime(0) {}
-
-    // Directories are stored as entries without a remote ID (no blob). This
-    // keeps the on-disk index format unchanged from earlier versions.
-    bool IsDirectory() const { return remote_id.empty(); }
+    bool IsDirectory() const { return type == EntryType::kDirectory; }
+    bool IsSymlink() const { return type == EntryType::kSymlink; }
+    bool IsFile() const { return type == EntryType::kFile; }
 };
 
-// Encrypted index that maps plaintext paths (e.g. "docs/notes.txt", no leading
-// slash) to remote IDs + metadata.
+// A fresh random inode ID.
+std::string NewInodeId();
+
+// Encrypted index: paths (e.g. "docs/notes.txt", no leading slash) → inodes.
 // Stored as `<backing_dir>/index.enc`. All methods are thread-safe.
+//
+// Format v2 (plaintext, inside the AES-GCM envelope):
+//   "EIX2" | generation:u64 | inode_count:u32 | inodes | path_count:u32 | paths
+//   inode: id | type:u8 | version:u64 | size:u64 | mtime:i64 | mode:u32 | target
+//   path:  path | inode id                       (strings are u32-length-prefixed)
+// v1 indexes (one flat entry per path, empty ID = directory) are still read
+// and are rewritten as v2 on the next save.
 class EncryptedIndex {
 public:
     EncryptedIndex(const std::string& backing_dir, const std::vector<uint8_t>& key);
 
-    // Load index from disk. Returns true if the index was loaded or doesn't
-    // exist yet; false if it exists but can't be read or decrypted (e.g. wrong
-    // key). On failure the in-memory index is left unchanged.
+    // Load from disk. True if loaded or absent; false if present but unreadable
+    // (e.g. wrong key). On failure the in-memory index is left unchanged.
     bool Load();
-
-    // Durably save the index (encrypted, atomic replace).
+    // Durably save (encrypted, atomic replace). Increments the generation.
     bool Save();
-
-    // True if an index file is present on disk.
     bool FileExists() const;
-
-    bool GetMetadata(const std::string& plaintext_name, FileMetadata& metadata);
-    void SetMetadata(const std::string& plaintext_name, const FileMetadata& metadata);
-    bool GetPlaintextName(const std::string& remote_id, std::string& plaintext_name);
-    void Remove(const std::string& plaintext_name);
-    bool Exists(const std::string& plaintext_name);
-    uint64_t IncrementVersion(const std::string& plaintext_name);
-    std::vector<std::string> GetAllPlaintextNames();
-    size_t Size();
-
     const std::string& path() const { return index_path_; }
 
+    // Bumped on every save; lets copies of the index be ordered.
+    uint64_t generation();
+    void set_generation(uint64_t g);
+
+    // ── Paths ──
+    // The inode behind `path`.
+    bool GetMetadata(const std::string& path, FileMetadata& metadata);
+    bool Exists(const std::string& path);
+    // Point `path` at inode `metadata.remote_id` (an empty ID gets a fresh
+    // one) and store `metadata` as that inode's data. If `path` referred to
+    // another inode, that link is dropped first.
+    void SetMetadata(const std::string& path, const FileMetadata& metadata);
+    // Unlink `path`. Returns true if that removed the inode's last link; its
+    // data is then copied to `*removed` if given.
+    bool Remove(const std::string& path, FileMetadata* removed = nullptr);
+    // Add `new_path` as another name for the file inode at `existing`.
+    bool Link(const std::string& existing, const std::string& new_path);
+    // Move `src` (and, for a directory, everything below it) to `dst`, which
+    // must not exist. Index-only: no data moves.
+    bool Rename(const std::string& src, const std::string& dst);
+
+    std::vector<std::string> GetAllPlaintextNames();
+    // Direct children of directory `dir` ("" = root), as base names, sorted.
+    std::vector<std::string> ListDirectory(const std::string& dir);
+    bool HasChildren(const std::string& dir);
+    // Every path strictly below `dir`, sorted (parents before children).
+    std::vector<std::string> Descendants(const std::string& dir);
+    size_t Size();  // number of paths
+
+    // ── Inodes ──
+    bool GetInode(const std::string& remote_id, FileMetadata& metadata);
+    // Update an existing inode's data (not its links). False if it is gone.
+    bool UpdateInode(const FileMetadata& metadata);
+    // Any path referring to the inode.
+    bool GetPlaintextName(const std::string& remote_id, std::string& path);
+    std::vector<FileMetadata> AllInodes();
+
+    uint64_t IncrementVersion(const std::string& path);
+
 private:
-    using ForwardMap = std::unordered_map<std::string, FileMetadata>;
-    using ReverseMap = std::unordered_map<std::string, std::string>;
+    struct State {
+        std::map<std::string, std::string> paths;                   // path → inode id
+        std::unordered_map<std::string, FileMetadata> inodes;        // id → data
+        std::unordered_map<std::string, std::set<std::string>> children;  // dir → base names
+        uint64_t generation = 0;
+    };
 
     std::string index_path_;
     std::vector<uint8_t> key_;
-    ForwardMap index_;          // plaintext -> metadata
-    ReverseMap reverse_index_;  // remote_id -> plaintext
+    State state_;
     std::mutex mutex_;
 
     std::vector<uint8_t> DeriveIndexKey() const;
-    std::vector<uint8_t> Serialize() const;
-    static bool Deserialize(const std::vector<uint8_t>& data, ForwardMap& fwd, ReverseMap& rev);
+    std::vector<uint8_t> SerializeLocked() const;
+    static bool Deserialize(const std::vector<uint8_t>& data, State& out);
+    static bool DeserializeV1(const std::vector<uint8_t>& data, State& out);
+    static void AddPath(State& s, const std::string& path, const std::string& id);
+    static void RemovePath(State& s, const std::string& path);
+    static void Relink(State& s);
 };
 
 } // namespace encfs

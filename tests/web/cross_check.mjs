@@ -15,6 +15,7 @@ const read = (p) => new Uint8Array(readFileSync(p));
 // ── C++ → JS ──
 const { keys, entries, legacyKey } = await encfs.openIndex(read(`${dir}/key`), read(`${dir}/backing/index.enc`));
 check(!legacyKey, "JS opens the C++ index with a hex key file");
+check(entries.generation >= 1, "JS reads index v2 (generation " + entries.generation + ")");
 const byName = new Map(entries.map((e) => [e.name, e]));
 
 for (const line of readFileSync(`${dir}/expected.tsv`, "utf8").split("\n").filter(Boolean)) {
@@ -22,8 +23,10 @@ for (const line of readFileSync(`${dir}/expected.tsv`, "utf8").split("\n").filte
   const entry = byName.get(name);
   if (!entry) { check(false, `index has '${name}'`); continue; }
   if (status === "dir") { check(entry.isDirectory, `'${name}' is a directory`); continue; }
-
-  check(entry.remoteId === await encfs.remoteIdFor(keys, name), `remote ID of '${name}' matches`);
+  if (status === "symlink") {
+    check(entry.isSymlink && encfs.toHex(new TextEncoder().encode(entry.target)) === hex, `'${name}' is a symlink to the right target`);
+    continue;
+  }
   const blob = read(`${dir}/backing/${entry.remoteId}.enc`);
   const res = await encfs.decryptFile(keys, blob, entry.remoteId, entry.version);
   const same = res.status === status && (status !== "ok" || encfs.toHex(res.plaintext) === hex);
@@ -66,6 +69,9 @@ for (const [i, [name, pt, cs]] of cases.entries()) {
   jsEntries.push({ name, remoteId, version, size: pt.length, mtime: 1700000000 + i });
 }
 writeFileSync(`${dir}/js/manifest.tsv`, manifest.join("\n") + "\n");
+jsEntries.push({ name: "js/dir", type: "directory", mode: 0o750, mtime: 1700000100 });
+jsEntries.push({ name: "js/link", type: "symlink", target: "../elsewhere", mode: 0o777 });
+jsEntries.push({ ...jsEntries[1], name: "js/one-hardlink" });  // same inode as js/one
 writeFileSync(`${dir}/js/index.enc`, await encfs.encryptIndex(keys, jsEntries));
 console.log(`  · wrote ${cases.length} JS blobs + index for C++ to verify`);
 
