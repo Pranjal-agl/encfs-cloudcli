@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <getopt.h>
+#include <sys/stat.h>
 #include <iostream>
 #include <unistd.h>
 
@@ -31,6 +32,18 @@ static void PrintUsage(const char* prog) {
         "  -c, --cloudcli CMD  cloudcli used to fetch blobs not cached locally\n"
         "  -l, --list          list the files in the index\n"
         "  -h, --help          show this help\n";
+}
+
+static void FetchIfMissing(CloudCLIWrapper& cloud, const std::string& remote_id,
+                           const std::string& path) {
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0) return;
+    const std::string tmp = path + ".download";
+    if (cloud.Download(remote_id, tmp) && ::rename(tmp.c_str(), path.c_str()) == 0) {
+        std::cerr << "Fetched " << remote_id << " from the cloud\n";
+    } else {
+        ::unlink(tmp.c_str());
+    }
 }
 
 static bool WriteAllTo(FILE* f, const std::vector<uint8_t>& data) {
@@ -68,6 +81,16 @@ int main(int argc, char* argv[]) {
     }
 
     std::string backing_dir = argv[optind];
+
+    // No local copy (e.g. recovering on a new machine): fetch the index, and
+    // the passphrase KDF parameters, from the cloud.
+    ::mkdir(backing_dir.c_str(), 0700);  // may not exist yet on a new machine
+    CloudCLIWrapper cloudcli(cloudcli_cmd);
+    FetchIfMissing(cloudcli, "index", backing_dir + "/index.enc");
+    if (key_options.use_passphrase) {
+        FetchIfMissing(cloudcli, "encfs.kdf", backing_dir + "/encfs.kdf");
+    }
+
     std::vector<uint8_t> master_key;
     std::string error;
     if (!ResolveMasterKey(key_options, backing_dir, /*allow_create=*/false, master_key, error)) {
@@ -104,7 +127,6 @@ int main(int argc, char* argv[]) {
     std::string blob_path = backing_dir + "/" + meta.remote_id + ".enc";
     std::vector<uint8_t> blob;
     if (!ReadWholeFile(blob_path, blob)) {
-        CloudCLIWrapper cloudcli(cloudcli_cmd);
         std::string tmp = blob_path + ".download";
         bool fetched = cloudcli.Download(meta.remote_id, tmp) && ReadWholeFile(tmp, blob);
         ::unlink(tmp.c_str());
