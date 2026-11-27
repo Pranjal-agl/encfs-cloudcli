@@ -96,4 +96,37 @@ FileCodec::Result FileCodec::Decrypt(const std::vector<uint8_t>& blob,
     return Result::kCorrupt;
 }
 
+FileCodec::Result FileCodec::OpenReader(const std::string& path,
+                                        const std::string& remote_id,
+                                        uint64_t expected_version,
+                                        std::unique_ptr<ChunkedReader>* reader,
+                                        uint64_t* actual_version) const {
+    reader->reset();
+    std::vector<uint8_t> chunk;
+    auto try_version = [&](uint64_t v) -> std::unique_ptr<ChunkedReader> {
+        auto r = ChunkedReader::Open(path, content_key_, Aad(remote_id, v));
+        if (r && r->ReadChunk(0, chunk)) return r;
+        return nullptr;
+    };
+
+    // Structurally not a v2 blob (e.g. legacy v1): let the caller decide.
+    if (!ChunkedReader::Open(path, content_key_)) return Result::kOk;
+
+    for (uint64_t v : {expected_version, expected_version + 1}) {
+        if (auto r = try_version(v)) {
+            SecureWipe(chunk);
+            *reader = std::move(r);
+            if (actual_version) *actual_version = v;
+            return Result::kOk;
+        }
+    }
+    for (uint64_t back = 1; back <= kRollbackProbe && back < expected_version; ++back) {
+        if (try_version(expected_version - back)) {
+            SecureWipe(chunk);
+            return Result::kRollback;
+        }
+    }
+    return Result::kCorrupt;
+}
+
 } // namespace encfs

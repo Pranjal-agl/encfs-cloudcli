@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -73,7 +74,7 @@ public:
 //   chunk), so even an empty file is authenticated.
 class ChunkedCrypto {
 public:
-    static constexpr size_t DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024; // 8 MiB
+    static constexpr size_t DEFAULT_CHUNK_SIZE = 1024 * 1024;     // 1 MiB (stored per blob)
     static constexpr size_t MAX_CHUNK_SIZE = 64 * 1024 * 1024;    // decode sanity limit
     static constexpr uint8_t FORMAT_VERSION = 2;
     static constexpr size_t HEADER_SIZE = 5 + 1 + 4 + 32;
@@ -126,6 +127,54 @@ public:
         const std::vector<uint8_t>& ciphertext,
         const std::vector<uint8_t>& key
     );
+};
+
+// Random-access reader for a v2 blob stored in a file. Because every
+// non-final chunk holds exactly chunk_size bytes, chunk i sits at a fixed
+// offset, so any byte range can be decrypted without touching the rest.
+//
+// The reader works on an open file descriptor, so it keeps reading a
+// consistent snapshot even if the blob is atomically replaced meanwhile.
+// Nothing is authenticated until ReadChunk() is called; a truncated or
+// extended blob is caught when its final chunk is read (wrong final flag).
+class ChunkedReader {
+public:
+    // Opens `path` and validates the header and overall layout. Returns
+    // nullptr if the file can't be opened or isn't a structurally valid v2
+    // blob. `aad` must match what the blob was encrypted with.
+    static std::unique_ptr<ChunkedReader> Open(const std::string& path,
+                                               const std::vector<uint8_t>& key,
+                                               const std::vector<uint8_t>& aad = {});
+    ~ChunkedReader();
+
+    ChunkedReader(const ChunkedReader&) = delete;
+    ChunkedReader& operator=(const ChunkedReader&) = delete;
+
+    uint64_t plaintext_size() const { return plaintext_size_; }
+    size_t chunk_size() const { return chunk_size_; }
+    uint64_t num_chunks() const { return num_chunks_; }
+
+    // Decrypt and authenticate chunk `index`. Returns false on I/O error or
+    // authentication failure (wrong key/AAD, tampering, truncation).
+    bool ReadChunk(uint64_t index, std::vector<uint8_t>& out);
+
+    // Copy plaintext bytes [offset, offset + len) into `buf`, decrypting the
+    // chunks involved (the most recent chunk is cached). Returns bytes copied
+    // (short at end of file) or -1 on failure.
+    int64_t ReadAt(uint64_t offset, uint8_t* buf, size_t len);
+
+private:
+    ChunkedReader() = default;
+
+    int fd_ = -1;
+    size_t chunk_size_ = 0;
+    uint64_t num_chunks_ = 0;
+    uint64_t plaintext_size_ = 0;
+    std::vector<uint8_t> file_key_;
+    std::vector<uint8_t> full_aad_;
+    uint64_t cached_index_ = UINT64_MAX;
+    std::vector<uint8_t> cache_;
+    std::vector<uint8_t> ct_;
 };
 
 // Single-shot AES-256-GCM for small data such as the index.

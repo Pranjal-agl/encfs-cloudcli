@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,17 @@ public:
                    uint64_t expected_version,
                    std::vector<uint8_t>& plaintext,
                    uint64_t* actual_version) const;
+
+    // Open a random-access reader over the blob file at `path`, verifying its
+    // first chunk against the same version rules as Decrypt(). On kOk,
+    // `*reader` is set. Legacy v1 blobs aren't supported here (`*reader` stays
+    // null with kOk — the caller should fall back to Decrypt()); the same goes
+    // for a file that can't be opened as a v2 blob.
+    Result OpenReader(const std::string& path,
+                      const std::string& remote_id,
+                      uint64_t expected_version,
+                      std::unique_ptr<class ChunkedReader>* reader,
+                      uint64_t* actual_version) const;
 
     // Chunk size for new blobs (tests use small values to exercise chunking).
     void set_chunk_size(size_t chunk_size) { chunk_size_ = chunk_size; }

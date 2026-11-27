@@ -51,6 +51,9 @@ struct OpenFile {
     std::string name;
     std::string remote_id;
     std::vector<uint8_t> data;
+    // Read-only access decrypts chunk by chunk through `reader`; the whole
+    // file is only loaded into `data` once something writes to it.
+    std::unique_ptr<ChunkedReader> reader;
     int64_t mtime = 0;
     bool loaded = false;   // `data` holds the file's contents
     bool dirty = false;    // `data` differs from what's on disk
@@ -192,33 +195,75 @@ int DecryptBlob(const std::string& name, FileMetadata meta,
     }
 }
 
-// Read and decrypt a file's contents, downloading the blob if needed.
-int LoadContents(const std::string& name, const FileMetadata& meta, std::vector<uint8_t>& out) {
+// Make a file readable: open a chunk-level reader over its blob (downloading
+// the blob first if it isn't cached), or for legacy v1 blobs decrypt it whole.
+int OpenForRead(OpenFile& file) {
+    if (file.loaded || file.reader) return 0;
+    FileMetadata meta;
+    if (!g_ctx->index->GetMetadata(file.name, meta)) return -ENOENT;
+
     const std::string path = BlobPath(meta.remote_id);
-    std::vector<uint8_t> blob;
-
-    if (ReadWholeFile(path, blob)) {
-        return DecryptBlob(name, meta, blob, out);
-    }
-    if (errno != ENOENT) return -EIO;
-
-    // Not cached locally: fetch it, and only keep it once it has verified.
-    std::string tmp = path + ".download";
-    if (!g_ctx->cloud->Download(meta.remote_id, tmp) || !ReadWholeFile(tmp, blob)) {
-        ::unlink(tmp.c_str());
-        if (meta.size == 0) {
-            // Older versions never wrote a blob for empty files.
-            out.clear();
-            return 0;
+    std::string source = path;
+    bool downloaded = false;
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        // Not cached locally: fetch it, and only keep it once it has verified.
+        source = path + ".download";
+        if (!g_ctx->cloud->Download(meta.remote_id, source)) {
+            ::unlink(source.c_str());
+            if (meta.size == 0) {  // older versions never wrote a blob for empty files
+                file.data.clear();
+                file.loaded = true;
+                return 0;
+            }
+            Log("'" + file.name + "': not cached locally and download failed");
+            return -EIO;
         }
-        Log("'" + name + "': not cached locally and download failed");
-        return -EIO;
+        downloaded = true;
     }
-    int rc = DecryptBlob(name, meta, blob, out);
-    if (rc == 0) {
-        if (::rename(tmp.c_str(), path.c_str()) != 0) ::unlink(tmp.c_str());
-    } else {
-        ::unlink(tmp.c_str());
+
+    int rc = 0;
+    std::unique_ptr<ChunkedReader> reader;
+    uint64_t actual = meta.version;
+    switch (g_ctx->codec->OpenReader(source, meta.remote_id, meta.version, &reader, &actual)) {
+    case FileCodec::Result::kOk:
+        if (!reader) {
+            // Legacy v1 blob (no random access): decrypt it in one go.
+            std::vector<uint8_t> blob;
+            rc = ReadWholeFile(source, blob) ? DecryptBlob(file.name, meta, blob, file.data) : -EIO;
+            if (rc == 0) file.loaded = true;
+        } else if (actual != meta.version) {
+            // Blob is one version ahead (crash before the index was saved).
+            meta.version = actual;
+            meta.size = reader->plaintext_size();
+            g_ctx->index->SetMetadata(file.name, meta);
+            SaveIndex();
+            file.reader = std::move(reader);
+        } else if (reader->plaintext_size() != meta.size) {
+            Log("'" + file.name + "': blob length doesn't match the index (truncated or extended)");
+            rc = -EIO;
+        } else {
+            file.reader = std::move(reader);
+        }
+        break;
+    case FileCodec::Result::kRollback:
+        Log("'" + file.name + "': blob is an older version than the index expects "
+            "(stale copy or rollback attempt) — refusing to read it");
+        rc = -EIO;
+        break;
+    case FileCodec::Result::kCorrupt:
+    default:
+        Log("'" + file.name + "': blob failed authentication (corrupt, tampered, or wrong file)");
+        rc = -EIO;
+        break;
+    }
+
+    if (downloaded) {
+        if (rc == 0 && ::rename(source.c_str(), path.c_str()) == 0) {
+            // keep the verified download as the local cache
+        } else {
+            ::unlink(source.c_str());
+        }
     }
     return rc;
 }
@@ -247,13 +292,24 @@ void ReleaseRef(const std::shared_ptr<OpenFile>& file) {
     SecureWipe(file->data);
 }
 
+// Load the whole file into memory (needed before modifying it).
 int EnsureLoaded(OpenFile& file) {
     if (file.loaded) return 0;
-    FileMetadata meta;
-    if (!g_ctx->index->GetMetadata(file.name, meta)) return -ENOENT;
-    int rc = LoadContents(file.name, meta, file.data);
-    if (rc == 0) file.loaded = true;
-    return rc;
+    if (int rc = OpenForRead(file)) return rc;
+    if (file.loaded) return 0;  // legacy blob, already decrypted in full
+
+    const uint64_t size = file.reader->plaintext_size();
+    if (size > kMaxFileSize) return -EFBIG;
+    file.data.resize(static_cast<size_t>(size));
+    if (file.reader->ReadAt(0, file.data.data(), file.data.size()) != static_cast<int64_t>(size)) {
+        SecureWipe(file.data);
+        file.data.clear();
+        Log("'" + file.name + "': blob failed authentication while loading");
+        return -EIO;
+    }
+    file.reader.reset();
+    file.loaded = true;
+    return 0;
 }
 
 // Encrypt and write back a dirty file, update the index, queue the upload.
@@ -459,9 +515,9 @@ int encfs_open(const char* path, struct fuse_file_info* fi) {
             file->loaded = true;
             file->dirty = true;
             file->mtime = Now();
-        } else if (int rc = EnsureLoaded(*file)) {
-            // Load for writers too: without the existing contents, appends
-            // and partial overwrites would destroy the rest of the file.
+        } else if (int rc = writable ? EnsureLoaded(*file) : OpenForRead(*file)) {
+            // Writers load the whole file: without the existing contents,
+            // appends and partial overwrites would destroy the rest of it.
             ReleaseRef(file);
             return rc;
         }
@@ -515,14 +571,24 @@ int encfs_read(const char* path, char* buf, size_t size, off_t offset,
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
         Handle* h = FindHandle(fi);
         if (!h) return -EBADF;
-        if (int rc = EnsureLoaded(*h->file)) return rc;
-
-        const auto& data = h->file->data;
         if (offset < 0) return -EINVAL;
-        if (static_cast<uint64_t>(offset) >= data.size()) return 0;
-        size_t n = std::min(size, data.size() - static_cast<size_t>(offset));
-        n = std::min<size_t>(n, INT_MAX);
-        std::memcpy(buf, data.data() + offset, n);
+        OpenFile& file = *h->file;
+        if (int rc = OpenForRead(file)) return rc;
+        size = std::min<size_t>(size, INT_MAX);
+
+        if (file.loaded) {
+            const auto& data = file.data;
+            if (static_cast<uint64_t>(offset) >= data.size()) return 0;
+            size_t n = std::min(size, data.size() - static_cast<size_t>(offset));
+            std::memcpy(buf, data.data() + offset, n);
+            return static_cast<int>(n);
+        }
+        int64_t n = file.reader->ReadAt(static_cast<uint64_t>(offset),
+                                        reinterpret_cast<uint8_t*>(buf), size);
+        if (n < 0) {
+            Log("'" + file.name + "': chunk failed authentication");
+            return -EIO;
+        }
         return static_cast<int>(n);
     });
 }

@@ -6,11 +6,15 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <climits>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace encfs {
 
@@ -501,6 +505,110 @@ bool ChunkedCrypto::DecryptStream(
     SecureWipe(file_key);
     SecureWipe(pt);
     return ok;
+}
+
+// ── ChunkedReader ───────────────────────────────────────────────────────────
+
+namespace {
+bool PreadFull(int fd, uint8_t* buf, size_t len, uint64_t offset) {
+    while (len > 0) {
+        ssize_t n = ::pread(fd, buf, len, static_cast<off_t>(offset));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        buf += n;
+        len -= static_cast<size_t>(n);
+        offset += static_cast<uint64_t>(n);
+    }
+    return true;
+}
+} // namespace
+
+std::unique_ptr<ChunkedReader> ChunkedReader::Open(const std::string& path,
+                                                   const std::vector<uint8_t>& key,
+                                                   const std::vector<uint8_t>& aad) {
+    if (key.size() != kKeySize) return nullptr;
+    std::unique_ptr<ChunkedReader> r(new ChunkedReader());
+    r->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (r->fd_ < 0) return nullptr;
+
+    struct stat st;
+    std::vector<uint8_t> header(ChunkedCrypto::HEADER_SIZE);
+    if (fstat(r->fd_, &st) != 0 || static_cast<uint64_t>(st.st_size) < header.size() ||
+        !PreadFull(r->fd_, header.data(), header.size(), 0)) {
+        return nullptr;
+    }
+    try {
+        r->chunk_size_ = ParseHeader(header.data());
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+
+    // Derive the chunk count and plaintext size from the blob's length.
+    const uint64_t body = static_cast<uint64_t>(st.st_size) - header.size();
+    const uint64_t span = 4 + r->chunk_size_ + kTagSize;
+    const uint64_t full = body / span;
+    const uint64_t rem = body % span;
+    if (rem == 0) {
+        if (full == 0) return nullptr;  // no chunks at all
+        r->num_chunks_ = full;
+        r->plaintext_size_ = full * r->chunk_size_;
+    } else {
+        if (rem < 4 + kTagSize) return nullptr;
+        r->num_chunks_ = full + 1;
+        r->plaintext_size_ = full * r->chunk_size_ + (rem - 4 - kTagSize);
+    }
+    if (r->num_chunks_ - 1 > UINT32_MAX) return nullptr;
+
+    r->file_key_ = FileKey(key, header.data() + 10);
+    r->full_aad_ = Concat(header, aad);
+    return r;
+}
+
+ChunkedReader::~ChunkedReader() {
+    if (fd_ >= 0) ::close(fd_);
+    SecureWipe(file_key_);
+    SecureWipe(cache_);
+}
+
+bool ChunkedReader::ReadChunk(uint64_t index, std::vector<uint8_t>& out) {
+    if (index >= num_chunks_) return false;
+    const bool last = (index + 1 == num_chunks_);
+    const size_t len = last ? static_cast<size_t>(plaintext_size_ - index * chunk_size_) : chunk_size_;
+    const uint64_t offset = ChunkedCrypto::HEADER_SIZE + index * (4 + chunk_size_ + kTagSize);
+
+    ct_.resize(4 + len + kTagSize);
+    if (!PreadFull(fd_, ct_.data(), ct_.size(), offset)) return false;
+    if (LoadU32LE(ct_.data()) != len) return false;
+
+    uint8_t nonce[kNonceSize];
+    ChunkNonce(static_cast<uint32_t>(index), last, nonce);
+    out.resize(len);
+    if (!GcmDecrypt(file_key_.data(), nonce, full_aad_.data(), full_aad_.size(),
+                    ct_.data() + 4, len, ct_.data() + 4 + len, out.data())) {
+        SecureWipe(out);
+        return false;
+    }
+    return true;
+}
+
+int64_t ChunkedReader::ReadAt(uint64_t offset, uint8_t* buf, size_t len) {
+    if (offset >= plaintext_size_) return 0;
+    len = static_cast<size_t>(std::min<uint64_t>(len, plaintext_size_ - offset));
+    size_t done = 0;
+    while (done < len) {
+        const uint64_t pos = offset + done;
+        const uint64_t index = pos / chunk_size_;
+        if (index != cached_index_) {
+            cached_index_ = UINT64_MAX;
+            if (!ReadChunk(index, cache_)) return -1;
+            cached_index_ = index;
+        }
+        const size_t in_chunk = static_cast<size_t>(pos - index * chunk_size_);
+        const size_t n = std::min(len - done, cache_.size() - in_chunk);
+        std::memcpy(buf + done, cache_.data() + in_chunk, n);
+        done += n;
+    }
+    return static_cast<int64_t>(done);
 }
 
 // ── Legacy v1 format (read-only) ────────────────────────────────────────────
