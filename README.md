@@ -9,12 +9,13 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 ## Features
 
 - **Transparent, authenticated encryption** — AES-256-GCM, with a fresh per-file key for every write
-- **Tamper-evident chunked format** — large files are split into 8 MiB chunks bound to their position, so chunks can't be reordered, dropped, duplicated or spliced between files
+- **Tamper-evident chunked format** — files are split into 1 MiB chunks bound to their position, so chunks can't be reordered, dropped, duplicated or spliced between files
 - **Blobs bound to their file and version** — swapping two files' blobs, or serving an old copy of a file (rollback), is detected
 - **Filename privacy** — plaintext names never leave the machine; blobs are named by an HMAC-SHA256 of the name
 - **Encrypted index** — the local name ↔ remote-ID mapping is itself AES-GCM encrypted
 - **Background sync** — uploads and deletes run in a worker thread with retries and exponential back-off; redundant operations are coalesced
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
+- **Random-access reads** — reading decrypts only the chunks you touch, with constant memory: `cat` of a 300 MB file peaks at 11 MB of RAM, where loading it whole took 580 MB
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — hex or raw key file, or a passphrase (PBKDF2-HMAC-SHA256, 600k iterations)
@@ -76,6 +77,8 @@ chunk i:        len:u32le | ciphertext[len] | tag:16
 - Every chunk authenticates `header ‖ "encfs-file-v2" ‖ remote_id ‖ version` as AAD, tying the blob to one file and one version.
 - An empty file is still one (empty) authenticated chunk.
 - All integers are little-endian, regardless of host.
+
+Because every non-final chunk is exactly `chunk_size` bytes, chunk *i* sits at a fixed offset. Reads decrypt only the chunks they cover. The plaintext length comes from the blob's length, and the final-chunk flag authenticates it.
 
 Blobs written by v1 are still readable and are rewritten as v2 the next time the file is modified.
 
@@ -200,7 +203,7 @@ CI runs everything, including the FUSE tests, in Release and in ASan/UBSan build
 
 - **Directory operations scale with the tree**: listing a directory scans the whole index. Renaming a directory re-encrypts every file below it, because remote IDs are derived from full paths. Both are fine for thousands of files, but not millions.
 - **No symlinks or hard links.**
-- **Whole-file buffering**: an open file is held in memory (capped at 4 GiB per file), and each save re-encrypts the whole file.
+- **Writes buffer the whole file**: reads are chunk-by-chunk, but a file opened for writing is held in memory (capped at 4 GiB), and each save re-encrypts it.
 - **Single writer**: don't mount the same cloud store from two machines at once. Each machine's index would overwrite the other's.
 - **Permissions aren't stored**: everything belongs to the mounting user. `chmod`/`chown` are accepted but ignored.
 - **Rename isn't atomic across a crash**: it re-encrypts the file under the new name's ID before removing the old one, so a crash mid-rename can leave both copies.
@@ -213,12 +216,18 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ## Roadmap
 
-- Chunk-level reads and writes, so large files aren't buffered whole
+- Chunk-level writes (re-encrypt only modified chunks), which needs per-chunk versioning
 - Optional filename padding to hide size/length patterns
 
 ---
 
 ## Changelog
+
+### v2.3 — random-access reads
+
+- Files opened read-only are decrypted chunk by chunk (`ChunkedReader`), with memory use independent of file size. On a 300 MB file, `cat` went from 580 MB to 11 MB peak RSS and from 0.66 s to 0.31 s. The first random read is about 7× faster.
+- The default chunk size went from 8 MiB to 1 MiB, so a small random read decrypts less. Existing blobs keep their own chunk size, which is stored in their headers.
+- Downloaded blobs are verified before they're cached. A blob whose length doesn't match the index is rejected.
 
 ### v2.2 — subdirectories
 

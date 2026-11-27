@@ -195,7 +195,7 @@ void TestChunkedRoundTrips() {
         CHECK(ChunkedCrypto::Decrypt(blob, kKey) == pt);
     }
 
-    // Default 8 MiB chunks with a multi-chunk file.
+    // Default chunk size with a multi-chunk file.
     auto big = Pattern(10 * 1024 * 1024);
     CHECK(ChunkedCrypto::Decrypt(ChunkedCrypto::Encrypt(big, kKey), kKey) == big);
 
@@ -350,6 +350,81 @@ void TestLegacyV1() {
     CHECK_THROWS(ChunkedCrypto::DecryptLegacyV1(v1, std::vector<uint8_t>(32, 1)));
 }
 
+// Write a blob to disk and open a reader over it.
+std::unique_ptr<ChunkedReader> ReaderFor(const TempDir& dir, const std::vector<uint8_t>& blob,
+                                         const std::vector<uint8_t>& aad = {}) {
+    std::string path = dir / ("blob" + std::to_string(blob.size()) + std::to_string(blob[blob.size() / 2]));
+    WriteFileAtomic(path, blob);
+    return ChunkedReader::Open(path, kKey, aad);
+}
+
+void TestReaderRandomAccess() {
+    TempDir dir;
+    const size_t cs = 100;
+    const auto aad = Bytes("file-id");
+    for (size_t n : {size_t(0), size_t(1), cs - 1, cs, cs + 1, 5 * cs, 7 * cs + 33}) {
+        auto pt = Pattern(n);
+        auto reader = ReaderFor(dir, ChunkedCrypto::Encrypt(pt, kKey, cs, aad), aad);
+        CHECK(reader != nullptr);
+        if (!reader) continue;
+        CHECK(reader->plaintext_size() == n);
+        CHECK(reader->chunk_size() == cs);
+        CHECK(reader->num_chunks() == std::max<size_t>(1, (n + cs - 1) / cs));
+
+        // Every (offset, length) window — including ones spanning chunks and
+        // running past EOF — must match the plaintext.
+        bool all_ok = true;
+        std::vector<uint8_t> buf(3 * cs);
+        for (size_t off = 0; off <= n + 2; off += 7) {
+            for (size_t len : {size_t(1), size_t(13), cs, 2 * cs + 5}) {
+                int64_t got = reader->ReadAt(off, buf.data(), len);
+                size_t want = off >= n ? 0 : std::min(len, n - off);
+                if (got != static_cast<int64_t>(want) ||
+                    !std::equal(buf.begin(), buf.begin() + static_cast<long>(want),
+                                pt.begin() + static_cast<long>(std::min(off, n)))) {
+                    all_ok = false;
+                }
+            }
+        }
+        CHECK(all_ok);
+    }
+}
+
+void TestReaderDetectsTampering() {
+    TempDir dir;
+    const size_t cs = 100;
+    auto blob = ChunkedCrypto::Encrypt(Pattern(3 * cs + 10), kKey, cs);
+    std::vector<uint8_t> out;
+
+    CHECK(ReaderFor(dir, blob, Bytes("other aad"))->ReadChunk(0, out) == false);
+
+    auto flipped = blob;
+    flipped[ChunkOffset(1, cs) + 10] ^= 1;
+    auto r = ReaderFor(dir, flipped);
+    CHECK(r->ReadChunk(0, out));       // untouched chunks still read fine...
+    CHECK(!r->ReadChunk(1, out));      // ...the tampered one doesn't
+    uint8_t byte;
+    CHECK(r->ReadAt(cs + 5, &byte, 1) == -1);
+
+    // Truncated at a chunk boundary: the new "last" chunk wasn't final.
+    auto truncated = std::vector<uint8_t>(blob.begin(), blob.begin() + ChunkOffset(2, cs));
+    auto rt = ReaderFor(dir, truncated);
+    CHECK(rt && rt->plaintext_size() == 2 * cs);
+    CHECK(rt && !rt->ReadChunk(1, out));
+
+    // Extended with a copy of a full chunk: the real final chunk is no longer last.
+    auto extended = std::vector<uint8_t>(blob.begin(), blob.begin() + ChunkOffset(3, cs));
+    extended.insert(extended.end(), blob.begin() + ChunkOffset(0, cs), blob.begin() + ChunkOffset(1, cs));
+    auto re = ReaderFor(dir, extended);
+    CHECK(re && !re->ReadChunk(re->num_chunks() - 1, out));
+
+    // Structurally invalid files are rejected up front.
+    CHECK(ReaderFor(dir, std::vector<uint8_t>(blob.begin(), blob.begin() + ChunkedCrypto::HEADER_SIZE)) == nullptr);
+    CHECK(ReaderFor(dir, std::vector<uint8_t>(blob.begin(), blob.begin() + ChunkedCrypto::HEADER_SIZE + 10)) == nullptr);
+    CHECK(ReaderFor(dir, Bytes("definitely not a blob at all, no")) == nullptr);
+    CHECK(ChunkedReader::Open(dir / "missing", kKey) == nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -367,5 +442,7 @@ int main() {
         {"Malformed headers rejected", TestMalformedHeaders},
         {"Streaming API interoperates with in-memory API", TestStreaming},
         {"Legacy v1 blobs still decrypt", TestLegacyV1},
+        {"ChunkedReader random access matches plaintext", TestReaderRandomAccess},
+        {"ChunkedReader detects tampering per chunk", TestReaderDetectsTampering},
     });
 }

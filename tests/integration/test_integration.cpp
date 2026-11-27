@@ -103,6 +103,30 @@ void TestCodecRoundTripAndBinding() {
     CHECK(codec.Decrypt(Bytes("junk"), id_a, 1, out, &actual) == FileCodec::Result::kCorrupt);
 }
 
+void TestCodecReader() {
+    TempDir dir;
+    FileCodec codec(kKey);
+    codec.set_chunk_size(64);
+    const std::string id = codec.RemoteIdFor("r"), other = codec.RemoteIdFor("s");
+    auto pt = Bytes(std::string(300, 'q'));
+    CHECK(WriteFileAtomic(dir / "blob", codec.Encrypt(pt, id, 5)));
+
+    std::unique_ptr<ChunkedReader> r;
+    uint64_t actual = 0;
+    CHECK(codec.OpenReader(dir / "blob", id, 5, &r, &actual) == FileCodec::Result::kOk);
+    CHECK(r && actual == 5 && r->plaintext_size() == pt.size());
+    std::vector<uint8_t> buf(pt.size());
+    CHECK(r && r->ReadAt(0, buf.data(), buf.size()) == static_cast<int64_t>(pt.size()) && buf == pt);
+
+    CHECK(codec.OpenReader(dir / "blob", id, 4, &r, &actual) == FileCodec::Result::kOk && actual == 5);
+    CHECK(codec.OpenReader(dir / "blob", id, 7, &r, &actual) == FileCodec::Result::kRollback && !r);
+    CHECK(codec.OpenReader(dir / "blob", other, 5, &r, &actual) == FileCodec::Result::kCorrupt && !r);
+
+    // Not a v2 blob: OK with no reader, so the caller falls back to Decrypt().
+    CHECK(WriteFileAtomic(dir / "junk", Bytes("junk")));
+    CHECK(codec.OpenReader(dir / "junk", id, 1, &r, &actual) == FileCodec::Result::kOk && !r);
+}
+
 // ── Key setup ───────────────────────────────────────────────────────────────
 
 void TestResolveMasterKey() {
@@ -318,6 +342,7 @@ int main() {
     return RunTests("integration", {
         {"Remote IDs are deterministic, opaque, v1-compatible", TestRemoteIds},
         {"FileCodec binds blobs to file and version", TestCodecRoundTripAndBinding},
+        {"FileCodec random-access reader", TestCodecReader},
         {"Master key resolution (hex, wrong key, legacy)", TestResolveMasterKey},
         {"Passphrase-derived keys", TestPassphraseMode},
         {"cloudcli upload/download/delete via stub", TestSyncCommands},
