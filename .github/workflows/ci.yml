@@ -18,9 +18,15 @@ jobs:
           - name: Release
             build_type: Release
             sanitize: OFF
+            tsan: OFF
           - name: Debug + ASan/UBSan
             build_type: Debug
             sanitize: ON
+            tsan: OFF
+          - name: Debug + TSan
+            build_type: Debug
+            sanitize: OFF
+            tsan: ON
 
     steps:
     - uses: actions/checkout@v4
@@ -41,6 +47,7 @@ jobs:
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         -DENCFS_WERROR=ON
         -DENCFS_SANITIZE=${{ matrix.sanitize }}
+        -DENCFS_TSAN=${{ matrix.tsan }}
         -DENCFS_E2E=ON
 
     - name: Build
@@ -51,6 +58,8 @@ jobs:
         node-version: 22
 
     - name: Test (unit, integration, FUSE end-to-end, browser cross-check)
+      env:
+        TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
       run: ctest --test-dir build --output-on-failure
 
   shellcheck:

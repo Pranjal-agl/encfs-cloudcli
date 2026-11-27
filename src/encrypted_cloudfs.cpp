@@ -2,7 +2,11 @@
 #include <fuse3/fuse.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <cstdlib>
+#include <dirent.h>
+#include <unordered_set>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -84,6 +88,13 @@ struct Context {
     // until the user remounts (and the index is restored).
     bool read_only = false;
 
+    // Local cache limit for blobs (0 = keep everything). See EnforceCacheLimit.
+    uint64_t cache_limit = 0;
+    // remote ID → the file version the cloud is known to hold (confirmed by a
+    // finished upload or a verified download). Persisted in synced.list.
+    std::unordered_map<std::string, uint64_t> synced;
+    bool synced_dirty = false;
+
     // One lock around all filesystem state. FUSE runs us single-threaded
     // (-s), so this costs nothing today but keeps us correct if that changes.
     std::mutex mutex;
@@ -92,6 +103,10 @@ struct Context {
 Context* g_ctx = nullptr;
 
 int SaveIndex();
+void MarkSynced(const std::string& id, uint64_t version);
+void Unsync(const std::string& id);
+void TouchBlob(const std::string& path);
+void EnforceCacheLimit();
 
 void Log(const std::string& msg) {
     std::cerr << "[encfs] " << msg << "\n";
@@ -265,10 +280,15 @@ int OpenContents(OpenFile& file) {
 
     if (downloaded) {
         if (rc == 0 && ::rename(source.c_str(), path.c_str()) == 0) {
-            // keep the verified download as the local cache
+            // Verified, so the cloud holds exactly this version.
+            FileMetadata now;
+            if (g_ctx->index->GetMetadata(file.name, now)) MarkSynced(now.remote_id, now.version);
+            EnforceCacheLimit();
         } else {
             ::unlink(source.c_str());
         }
+    } else if (rc == 0) {
+        TouchBlob(path);
     }
     if (rc != 0) file.contents.reset();
     return rc;
@@ -319,6 +339,7 @@ int Persist(OpenFile& file) {
 
     const uint64_t version = meta.version + 1;
     const std::string path = BlobPath(file.remote_id);
+    Unsync(file.remote_id);  // the cloud is about to be behind
     AtomicFile out(path, 0600);
     bool ok = out.Open();
     if (ok) {
@@ -359,6 +380,7 @@ int Persist(OpenFile& file) {
 
     file.dirty = false;
     g_ctx->cloud->QueueUpload(path);
+    EnforceCacheLimit();
     return 0;
 }
 
@@ -366,6 +388,7 @@ int Persist(OpenFile& file) {
 void RemoveFile(const std::string& name, const FileMetadata& meta) {
     g_ctx->index->Remove(name);
     SaveIndex();
+    Unsync(meta.remote_id);
     ::unlink(BlobPath(meta.remote_id).c_str());
     g_ctx->cloud->QueueDelete(meta.remote_id);
 
@@ -412,6 +435,166 @@ int SaveIndex() {
     return 0;
 }
 
+// ── Local cache limit ───────────────────────────────────────────────────────
+// With --cache-size, the backing directory is a cache: blobs the cloud is
+// known to hold at their current version can be deleted locally and are
+// downloaded again on demand. A blob is only ever evicted if
+//   * synced[id] equals the file's version in the index (the cloud has
+//     exactly this version — not an older one),
+//   * nothing is queued, in flight or journaled for it, and
+//   * the file isn't open.
+// Least recently used blobs go first.
+
+std::string SyncedPath() { return g_ctx->backing_dir + "/synced.list"; }
+
+void LoadSynced() {
+    std::vector<uint8_t> data;
+    if (!ReadWholeFile(SyncedPath(), data)) return;
+    std::string text(data.begin(), data.end());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = nl == std::string::npos ? text.size() : nl + 1;
+        auto sp = line.find(' ');
+        if (sp == 64) g_ctx->synced[line.substr(0, 64)] = std::strtoull(line.c_str() + 65, nullptr, 10);
+    }
+}
+
+void SaveSynced() {
+    if (!g_ctx->synced_dirty || g_ctx->cache_limit == 0) return;
+    std::string text;
+    for (const auto& [id, version] : g_ctx->synced) text += id + " " + std::to_string(version) + "\n";
+    if (WriteFileAtomic(SyncedPath(), reinterpret_cast<const uint8_t*>(text.data()), text.size())) {
+        g_ctx->synced_dirty = false;
+    }
+}
+
+void MarkSynced(const std::string& id, uint64_t version) {
+    auto it = g_ctx->synced.find(id);
+    if (it != g_ctx->synced.end() && it->second == version) return;
+    g_ctx->synced[id] = version;
+    g_ctx->synced_dirty = true;
+}
+
+void Unsync(const std::string& id) {
+    if (g_ctx->synced.erase(id)) g_ctx->synced_dirty = true;
+}
+
+// Record a use of a blob for LRU ordering (explicitly, so noatime mounts work).
+void TouchBlob(const std::string& path) {
+    struct timespec times[2];
+    times[0].tv_sec = 0;
+    times[0].tv_nsec = UTIME_NOW;
+    times[1].tv_sec = 0;
+    times[1].tv_nsec = UTIME_OMIT;
+    ::utimensat(AT_FDCWD, path.c_str(), times, 0);
+}
+
+bool IsBlobName(const std::string& n) {
+    return n.size() == 68 && n.compare(64, 4, ".enc") == 0 &&
+           n.find_first_not_of("0123456789abcdef") == 64;
+}
+
+void EnforceCacheLimit() {
+    if (g_ctx->cache_limit == 0) return;
+
+    struct Blob { std::string id; uint64_t bytes; struct timespec used; };
+    std::vector<Blob> blobs;
+    uint64_t total = 0;
+    if (DIR* d = ::opendir(g_ctx->backing_dir.c_str())) {
+        while (struct dirent* e = ::readdir(d)) {
+            std::string n = e->d_name;
+            if (!IsBlobName(n)) continue;
+            struct stat st;
+            if (::stat((g_ctx->backing_dir + "/" + n).c_str(), &st) != 0) continue;
+            total += static_cast<uint64_t>(st.st_size);
+            blobs.push_back({n.substr(0, 64), static_cast<uint64_t>(st.st_size), st.st_atim});
+        }
+        ::closedir(d);
+    }
+    if (total <= g_ctx->cache_limit) return;
+
+    std::unordered_set<std::string> open_ids;
+    for (const auto& [name, file] : g_ctx->open_files) open_ids.insert(file->remote_id);
+
+    std::sort(blobs.begin(), blobs.end(), [](const Blob& a, const Blob& b) {
+        return a.used.tv_sec != b.used.tv_sec ? a.used.tv_sec < b.used.tv_sec
+                                              : a.used.tv_nsec < b.used.tv_nsec;
+    });
+    for (const auto& blob : blobs) {
+        if (total <= g_ctx->cache_limit) break;
+        std::string name;
+        FileMetadata meta;
+        auto synced = g_ctx->synced.find(blob.id);
+        if (synced == g_ctx->synced.end() || open_ids.count(blob.id) ||
+            !g_ctx->index->GetPlaintextName(blob.id, name) ||
+            !g_ctx->index->GetMetadata(name, meta) || meta.version != synced->second ||
+            g_ctx->cloud->IsPending(blob.id)) {
+            continue;  // not provably safe in the cloud
+        }
+        if (::unlink(BlobPath(blob.id).c_str()) == 0) total -= blob.bytes;
+    }
+    SaveSynced();
+}
+
+// Called by the sync worker after an upload finishes.
+void OnUploaded(const std::string& id) {
+    if (id.size() != 64) return;  // index / KDF objects
+    std::lock_guard<std::mutex> lock(g_ctx->mutex);
+    std::string name;
+    FileMetadata meta;
+    if (!g_ctx->index->GetPlaintextName(id, name) || !g_ctx->index->GetMetadata(name, meta)) return;
+    // If another save is already queued, the cloud may still lag behind.
+    if (g_ctx->cloud->IsPending(id)) return;
+    MarkSynced(id, meta.version);
+    EnforceCacheLimit();
+    SaveSynced();
+}
+
+// At mount: upload any local blob the cloud isn't known to have at its
+// current version (e.g. an upload lost in a crash), and forget stale records.
+void ReconcileWithCloud() {
+    std::unordered_set<std::string> live;
+    for (const auto& name : g_ctx->index->GetAllPlaintextNames()) {
+        FileMetadata meta;
+        if (!g_ctx->index->GetMetadata(name, meta) || meta.IsDirectory()) continue;
+        live.insert(meta.remote_id);
+        auto it = g_ctx->synced.find(meta.remote_id);
+        const std::string path = BlobPath(meta.remote_id);
+        struct stat st;
+        if ((it == g_ctx->synced.end() || it->second != meta.version) &&
+            ::stat(path.c_str(), &st) == 0 && !g_ctx->cloud->IsPending(meta.remote_id)) {
+            g_ctx->cloud->QueueUpload(path);
+        }
+    }
+    for (auto it = g_ctx->synced.begin(); it != g_ctx->synced.end();) {
+        if (!live.count(it->first)) {
+            it = g_ctx->synced.erase(it);
+            g_ctx->synced_dirty = true;
+        } else {
+            ++it;
+        }
+    }
+}
+
+uint64_t ParseSize(const std::string& text) {
+    char* end = nullptr;
+    double value = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || value < 0) return UINT64_MAX;
+    std::string unit(end);
+    for (auto& c : unit) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (!unit.empty() && unit.back() == 'B') unit.pop_back();
+    if (!unit.empty() && unit.back() == 'I') unit.pop_back();  // "GiB" etc.
+    double mult = 1;
+    if (unit == "K") mult = 1024.0;
+    else if (unit == "M") mult = 1024.0 * 1024;
+    else if (unit == "G") mult = 1024.0 * 1024 * 1024;
+    else if (unit == "T") mult = 1024.0 * 1024 * 1024 * 1024;
+    else if (!unit.empty()) return UINT64_MAX;
+    return static_cast<uint64_t>(value * mult);
+}
+
 // ── FUSE operations ─────────────────────────────────────────────────────────
 
 void* encfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
@@ -436,6 +619,9 @@ void encfs_destroy(void* private_data) {
         Log("finishing " + std::to_string(pending) + " pending cloud operation(s)...");
     }
     g_ctx->cloud->StopBackgroundUploader();  // drains the queue
+    std::lock_guard<std::mutex> lock(g_ctx->mutex);
+    EnforceCacheLimit();
+    SaveSynced();
 }
 
 int encfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
@@ -782,6 +968,7 @@ int MoveFile(const std::string& src, const FileMetadata& src_meta, const std::st
         file->remote_id = old_id;
         g_ctx->open_files[src] = file;
     } else {
+        Unsync(old_id);
         ::unlink(BlobPath(old_id).c_str());
         g_ctx->cloud->QueueDelete(old_id);
     }
@@ -959,6 +1146,9 @@ void PrintUsage(const char* prog) {
         "                      ($ENCFS_PASSPHRASE, or prompt)\n"
         "  -c, --cloudcli CMD  cloudcli executable (default: $ENCFS_CLOUDCLI or cloudcli)\n"
         "  -b, --background    detach from the terminal once mounted\n"
+        "      --cache-size N  keep at most N of encrypted blobs locally (e.g. 500M, 20G);\n"
+        "                      older ones the cloud already has are removed and\n"
+        "                      downloaded again when needed (default: keep everything)\n"
         "  -d, --debug         print FUSE debug output\n"
         "  -h, --help          show this help\n"
         "  -V, --version       show version\n"
@@ -972,6 +1162,7 @@ int main(int argc, char* argv[]) {
     KeyOptions key_options;
     std::string cloudcli_cmd = CloudCLIWrapper::DefaultCommand();
     bool background = false;
+    uint64_t cache_limit = 0;
     bool debug = false;
 
     static const struct option long_opts[] = {
@@ -979,6 +1170,7 @@ int main(int argc, char* argv[]) {
         {"passphrase", no_argument, nullptr, 'p'},
         {"cloudcli", required_argument, nullptr, 'c'},
         {"background", no_argument, nullptr, 'b'},
+        {"cache-size", required_argument, nullptr, 'S'},
         {"debug", no_argument, nullptr, 'd'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, nullptr, 'V'},
@@ -991,6 +1183,13 @@ int main(int argc, char* argv[]) {
         case 'p': key_options.use_passphrase = true; break;
         case 'c': cloudcli_cmd = optarg; break;
         case 'b': background = true; break;
+        case 'S':
+            cache_limit = ParseSize(optarg);
+            if (cache_limit == UINT64_MAX) {
+                std::cerr << "Invalid --cache-size: " << optarg << " (try e.g. 500M or 20G)\n";
+                return 2;
+            }
+            break;
         case 'd': debug = true; break;
         case 'h': PrintUsage(argv[0]); return 0;
         case 'V': std::cout << "encfs-cloudcli " << ENCFS_VERSION << "\n"; return 0;
@@ -1070,6 +1269,7 @@ int main(int argc, char* argv[]) {
     }
 
     ctx->index_guard_pending = fresh_index;
+    ctx->cache_limit = cache_limit;
     ctx->cloud->SetJournalPath(backing_dir + "/sync.journal");
     if (size_t resumed = ctx->cloud->RecoverJournal()) {
         std::cerr << "[encfs] resuming " << resumed << " unfinished cloud operation(s)\n";
@@ -1078,6 +1278,13 @@ int main(int argc, char* argv[]) {
         ctx->cloud->QueueUpload(kdf_path);  // KDF parameters were just created
     }
     g_ctx = ctx.get();
+    if (cache_limit > 0) {
+        LoadSynced();
+        ReconcileWithCloud();
+        ctx->cloud->SetUploadCallback(OnUploaded);
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        EnforceCacheLimit();
+    }
 
     std::vector<std::string> fuse_args = {argv[0], mount_point, "-s",
                                           "-o", "fsname=encfs-cloudcli,subtype=encfs"};

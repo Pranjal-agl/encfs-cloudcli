@@ -28,8 +28,9 @@ check() { local desc=$1; shift; if "$@"; then pass "$desc"; else fail "$desc"; f
 check_fails() { local desc=$1; shift; if "$@"; then fail "$desc"; else pass "$desc"; fi; }
 
 CLOUDCLI="$STUB"
+EXTRA_ARGS=()
 mount_fs() {
-    "$FS_BIN" -k "$KEY" -c "$CLOUDCLI" "$MNT" "$BACK" >>"$LOG" 2>&1 &
+    "$FS_BIN" -k "$KEY" -c "$CLOUDCLI" "${EXTRA_ARGS[@]}" "$MNT" "$BACK" >>"$LOG" 2>&1 &
     FS_PID=$!
     for _ in $(seq 50); do
         mountpoint -q "$MNT" && return 0
@@ -267,6 +268,46 @@ cp "$SOME_BLOB" "$BACK/$(printf 'f%.0s' $(seq 64)).enc"
 check "--verify reports leftover blobs" \
     bash -c "'$DECRYPT_BIN' -k '$KEY' -c '$STUB' --verify '$BACK' 2>/dev/null | grep -q LEFTOVER"
 rm "$BACK/$(printf 'f%.0s' $(seq 64)).enc"
+
+# ── Local cache limit ──
+# A separate store and backing dir, so the counts below are self-contained.
+MAIN_BACK="$BACK"; MAIN_STORE="$ENCFS_STUB_STORE"
+BACK="$WORK/cache_backing"; export ENCFS_STUB_STORE="$WORK/cache_cloud"
+local_bytes() { find "$BACK" -maxdepth 1 -name '*.enc' ! -name index.enc -printf '%s\n' | awk '{s+=$1} END {print s+0}'; }
+for i in 1 2 3 4; do head -c 600000 /dev/urandom > "$WORK/cache_src$i"; done
+EXTRA_ARGS=(--cache-size 1M)
+
+# Cloud down: nothing may be evicted, whatever the limit says.
+export ENCFS_STUB_FAIL=1
+mount_fs || fail "mount (cloud down)"
+for i in 1 2 3 4; do cp "$WORK/cache_src$i" "$MNT/f$i"; done
+unmount_fs
+unset ENCFS_STUB_FAIL
+check "cloud down: every blob kept locally"  [ "$(local_bytes)" -gt 2400000 ]
+check "cloud down: work left in the journal" [ -s "$BACK/sync.journal" ]
+
+# Cloud back: the journal uploads them, and the cache shrinks to the limit.
+mount_fs || fail "mount (cloud up)"
+check "files readable after reconnect"      cmp -s "$WORK/cache_src2" "$MNT/f2"
+unmount_fs
+check "cloud got all four blobs"            [ "$(cloud_ids | wc -l)" = 4 ]
+check "local cache within 1 MiB"            [ "$(local_bytes)" -le 1048576 ]
+check "synced.list records the uploads"     [ "$(wc -l < "$BACK/synced.list")" = 4 ]
+
+# Evicted files come back from the cloud on demand, and stay within the limit.
+mount_fs || fail "mount (evicted cache)"
+ALL_OK=1
+for i in 1 2 3 4; do cmp -s "$WORK/cache_src$i" "$MNT/f$i" || ALL_OK=0; done
+check "evicted files re-download intact"    [ "$ALL_OK" = 1 ]
+echo "edit" >> "$MNT/f1"
+check "evicted file can be edited"          [ "$(tail -c 5 "$MNT/f1")" = "edit" ]
+unmount_fs
+check "still within 1 MiB after reads"      [ "$(local_bytes)" -le 1048576 ]
+mount_fs || fail "mount (after edit)"
+check "edit survived eviction"              [ "$(tail -c 5 "$MNT/f1")" = "edit" ]
+unmount_fs
+EXTRA_ARGS=()
+BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

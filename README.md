@@ -18,6 +18,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Background sync** — uploads and deletes run in a worker thread with retries and exponential back-off; redundant operations are coalesced
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
 - **Constant memory, any file size** — reads decrypt only the chunks they touch, and writes keep only a few chunks in RAM. Copying in a 1 GB file peaks at 21 MB, where buffering it whole took about 2 GB.
+- **Bounded local cache** — with `--cache-size 20G` the backing directory becomes a cache. Blobs the cloud provably holds at their current version are evicted least-recently-used first, and nothing is evicted while an upload is pending.
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — hex or raw key file, or a passphrase (PBKDF2-HMAC-SHA256, 600k iterations)
@@ -177,10 +178,25 @@ encrypted_cloudfs [options] <mountpoint> <backing_dir> [-- <fuse options>]
   -p, --passphrase    derive the key from a passphrase ($ENCFS_PASSPHRASE, or prompt)
   -c, --cloudcli CMD  cloudcli executable (default: $ENCFS_CLOUDCLI or cloudcli)
   -b, --background    detach from the terminal once mounted
+      --cache-size N  keep at most N of blobs locally (e.g. 500M, 20G); default: keep all
   -d, --debug         print FUSE debug output
 ```
 
 If the backing directory already has an index, the key must be able to decrypt it. Otherwise the filesystem refuses to mount, so a wrong key can't overwrite your index.
+
+### Limiting local disk use
+
+By default the backing directory keeps every blob, so it is a complete local copy. With `--cache-size N` it becomes a cache:
+
+- Every confirmed upload, and every verified download, records which version of a file the cloud holds, in `synced.list`.
+- When the cache is over its limit, least-recently-used blobs are deleted, but only if all of these hold:
+  - the cloud holds exactly the version the index expects;
+  - no upload or delete is queued, in flight or journaled for it;
+  - the file isn't open.
+- Evicted files are downloaded and verified again when they're next opened.
+- On each mount, any local blob that isn't confirmed in the cloud at its current version is uploaded again. This also catches uploads lost in a crash.
+
+If the cloud is unreachable, nothing is evicted and the cache can grow past its limit. Running out of disk space is better than losing data.
 
 ### Recovering and checking files without mounting
 
@@ -251,6 +267,13 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v2.7 — bounded local cache
+
+- `--cache-size N` turns the backing directory into an LRU cache. It only evicts blobs that `synced.list` shows the cloud holds at their current version, with nothing pending and the file not open. Each mount re-uploads anything not confirmed.
+- `cloudcli` wrapper: `IsPending()` and an upload-completion callback.
+- e2e: nothing is evicted while the cloud is down; after reconnecting, the journal uploads and the cache shrinks to the limit; evicted files re-download intact and can be edited.
+- CI adds a ThreadSanitizer build.
 
 ### v2.6 — constant-memory writes
 

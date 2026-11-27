@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -66,6 +67,14 @@ public:
     bool WaitIdle(std::chrono::milliseconds timeout);
     size_t PendingCount();
 
+    // True if an operation for `remote_id` is queued, in flight, or failed
+    // and waiting for the next mount.
+    bool IsPending(const std::string& remote_id);
+
+    // Called on the worker thread (with no internal lock held) after an
+    // upload succeeds, with the remote ID that was uploaded.
+    void SetUploadCallback(std::function<void(const std::string&)> callback);
+
 private:
     struct Op {
         enum Kind { kUpload, kDelete } kind = kUpload;
@@ -86,6 +95,8 @@ private:
     std::unordered_map<std::string, Op> pending_;  // remote ID -> desired op
     std::unordered_map<std::string, Op> failed_;   // gave up this session; kept in journal
     bool in_flight_ = false;
+    std::string in_flight_id_;
+    std::function<void(const std::string&)> upload_callback_;
     bool stop_ = false;
     std::thread worker_;
 

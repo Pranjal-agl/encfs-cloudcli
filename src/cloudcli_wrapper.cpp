@@ -173,12 +173,22 @@ void CloudCLIWrapper::WorkerLoop() {
         pending_.erase(it);
 
         in_flight_ = true;
+        in_flight_id_ = remote_id;
         failed_[remote_id] = op;  // keeps it in the journal while in flight
+        auto callback = upload_callback_;
         lock.unlock();
         bool ok = Run(op, remote_id);
         lock.lock();
         in_flight_ = false;
+        in_flight_id_.clear();
         failed_.erase(remote_id);
+        if (ok && op.kind == Op::kUpload && callback) {
+            // Outside our lock: the callback may take the filesystem's lock,
+            // and the filesystem calls into us while holding it.
+            lock.unlock();
+            callback(remote_id);
+            lock.lock();
+        }
 
         if (!ok && pending_.count(remote_id) == 0) {
             // Not superseded by a newer op — retry, or give up for this session.
@@ -224,6 +234,17 @@ void CloudCLIWrapper::StopBackgroundUploader() {
 bool CloudCLIWrapper::WaitIdle(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
     return idle_cv_.wait_for(lock, timeout, [this] { return order_.empty() && !in_flight_; });
+}
+
+bool CloudCLIWrapper::IsPending(const std::string& remote_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pending_.count(remote_id) > 0 || failed_.count(remote_id) > 0 ||
+           (in_flight_ && in_flight_id_ == remote_id);
+}
+
+void CloudCLIWrapper::SetUploadCallback(std::function<void(const std::string&)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    upload_callback_ = std::move(callback);
 }
 
 size_t CloudCLIWrapper::PendingCount() {

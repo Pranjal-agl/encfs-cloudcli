@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(encfs-cloudcli VERSION 2.6.0 LANGUAGES CXX)
+project(encfs-cloudcli VERSION 2.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ endif()
 
 option(ENCFS_WERROR   "Treat compiler warnings as errors" OFF)
 option(ENCFS_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+option(ENCFS_TSAN     "Build with ThreadSanitizer" OFF)
 option(ENCFS_E2E      "Register the FUSE end-to-end test (needs /dev/fuse and fusermount3)" OFF)
 
 find_package(PkgConfig REQUIRED)
@@ -25,6 +26,10 @@ target_compile_options(encfs_options INTERFACE -Wall -Wextra -Wpedantic -Wshadow
 target_compile_definitions(encfs_options INTERFACE ENCFS_VERSION="${PROJECT_VERSION}")
 if(ENCFS_WERROR)
     target_compile_options(encfs_options INTERFACE -Werror)
+endif()
+if(ENCFS_TSAN)
+    target_compile_options(encfs_options INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(encfs_options INTERFACE -fsanitize=thread)
 endif()
 if(ENCFS_SANITIZE)
     target_compile_options(encfs_options INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
