@@ -1,6 +1,7 @@
 #define FUSE_USE_VERSION 31
 #include <fuse3/fuse.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdio>
@@ -112,13 +113,54 @@ int Guarded(const char* op, Fn&& fn) {
     }
 }
 
-// The filesystem is flat: "/name" only. Returns 0 and sets `name`, or -errno.
+// Turn a FUSE path ("/a/b.txt") into an index key ("a/b.txt"). Returns 0, or
+// -errno for the root or a malformed path.
 int NameFromPath(const char* path, std::string& name) {
     if (path[0] != '/' || path[1] == '\0') return -ENOENT;
     name = path + 1;
-    if (name.find('/') != std::string::npos) return -ENOENT;
-    if (name.size() > 255) return -ENAMETOOLONG;
-    return 0;
+    if (name.size() >= PATH_MAX) return -ENAMETOOLONG;
+    size_t start = 0;
+    for (;;) {
+        size_t slash = name.find('/', start);
+        size_t len = (slash == std::string::npos ? name.size() : slash) - start;
+        if (len == 0) return -EINVAL;
+        if (len > 255) return -ENAMETOOLONG;
+        if ((len == 1 && name[start] == '.') ||
+            (len == 2 && name[start] == '.' && name[start + 1] == '.')) {
+            return -EINVAL;
+        }
+        if (slash == std::string::npos) return 0;
+        start = slash + 1;
+    }
+}
+
+// "a/b/c.txt" → "a/b"; top-level names → "" (the root).
+std::string ParentOf(const std::string& name) {
+    auto slash = name.find_last_of('/');
+    return slash == std::string::npos ? std::string() : name.substr(0, slash);
+}
+
+// The parent of `name` must be the root or an existing directory.
+int CheckParent(const std::string& name) {
+    const std::string parent = ParentOf(name);
+    if (parent.empty()) return 0;
+    FileMetadata meta;
+    if (!g_ctx->index->GetMetadata(parent, meta)) return -ENOENT;
+    return meta.IsDirectory() ? 0 : -ENOTDIR;
+}
+
+// Every index entry strictly below directory `dir` ("" = root), sorted so
+// that parents come before their children.
+std::vector<std::string> DescendantsOf(const std::string& dir) {
+    const std::string prefix = dir.empty() ? "" : dir + "/";
+    std::vector<std::string> out;
+    for (auto& name : g_ctx->index->GetAllPlaintextNames()) {
+        if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0) {
+            out.push_back(std::move(name));
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 std::string BlobPath(const std::string& remote_id) {
@@ -343,6 +385,13 @@ int encfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) 
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
 
+        if (meta.IsDirectory()) {
+            st->st_mode = S_IFDIR | 0755;
+            st->st_nlink = 2;
+            st->st_mtime = st->st_ctime = st->st_atime = static_cast<time_t>(meta.mtime);
+            return 0;
+        }
+
         uint64_t size = meta.size;
         int64_t mtime = meta.mtime;
         auto it = g_ctx->open_files.find(name);
@@ -366,12 +415,20 @@ int encfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t off
     (void)fi;
     (void)flags;
     return Guarded("readdir", [&]() -> int {
-        if (std::strcmp(path, "/") != 0) return -ENOENT;
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        std::string dir;
+        if (std::strcmp(path, "/") != 0) {
+            if (int rc = NameFromPath(path, dir)) return rc;
+            FileMetadata meta;
+            if (!g_ctx->index->GetMetadata(dir, meta)) return -ENOENT;
+            if (!meta.IsDirectory()) return -ENOTDIR;
+        }
         filler(buf, ".", nullptr, 0, fuse_fill_dir_flags(0));
         filler(buf, "..", nullptr, 0, fuse_fill_dir_flags(0));
-        for (const auto& name : g_ctx->index->GetAllPlaintextNames()) {
-            filler(buf, name.c_str(), nullptr, 0, fuse_fill_dir_flags(0));
+        const size_t skip = dir.empty() ? 0 : dir.size() + 1;
+        for (const auto& name : DescendantsOf(dir)) {
+            if (name.find('/', skip) != std::string::npos) continue;  // not a direct child
+            filler(buf, name.c_str() + skip, nullptr, 0, fuse_fill_dir_flags(0));
         }
         return 0;
     });
@@ -391,6 +448,7 @@ int encfs_open(const char* path, struct fuse_file_info* fi) {
         if (int rc = NameFromPath(path, name)) return rc;
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+        if (meta.IsDirectory()) return -EISDIR;
 
         const bool writable = (fi->flags & O_ACCMODE) != O_RDONLY;
         if (writable && g_ctx->read_only) return -EROFS;
@@ -419,9 +477,12 @@ int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
         std::string name;
         if (int rc = NameFromPath(path, name)) return rc;
 
+        if (int rc = CheckParent(name)) return rc;
+
         FileMetadata meta;
         const bool existed = g_ctx->index->GetMetadata(name, meta);
         if (existed && (fi->flags & O_EXCL)) return -EEXIST;
+        if (existed && meta.IsDirectory()) return -EISDIR;
         if (!existed) {
             meta = FileMetadata();
             meta.remote_id = g_ctx->codec->RemoteIdFor(name);
@@ -504,6 +565,7 @@ int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
             if (int rc = NameFromPath(path, name)) return rc;
             FileMetadata meta;
             if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+            if (meta.IsDirectory()) return -EISDIR;
             file = Acquire(name, meta);
             temporary = true;
         }
@@ -569,13 +631,113 @@ int encfs_unlink(const char* path) {
         if (int rc = NameFromPath(path, name)) return rc;
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+        if (meta.IsDirectory()) return -EISDIR;
         RemoveFile(name, meta);
         return 0;
     });
 }
 
-// Remote IDs are derived from the name, so a rename re-encrypts the contents
-// under the new ID (the blob is also bound to its ID) and removes the old one.
+int encfs_mkdir(const char* path, mode_t mode) {
+    (void)mode;
+    return Guarded("mkdir", [&]() -> int {
+        std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
+        std::string name;
+        if (int rc = NameFromPath(path, name)) return rc;
+        if (int rc = CheckParent(name)) return rc;
+        if (g_ctx->index->Exists(name)) return -EEXIST;
+
+        FileMetadata meta;  // empty remote_id = directory
+        meta.mtime = Now();
+        g_ctx->index->SetMetadata(name, meta);
+        if (int rc = SaveIndex()) {
+            g_ctx->index->Remove(name);
+            return rc;
+        }
+        return 0;
+    });
+}
+
+int encfs_rmdir(const char* path) {
+    return Guarded("rmdir", [&]() -> int {
+        std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
+        std::string name;
+        if (int rc = NameFromPath(path, name)) return rc;
+        FileMetadata meta;
+        if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+        if (!meta.IsDirectory()) return -ENOTDIR;
+        if (!DescendantsOf(name).empty()) return -ENOTEMPTY;
+        g_ctx->index->Remove(name);
+        return SaveIndex();
+    });
+}
+
+// Move one file from `src` to `dst` (which must be free). Remote IDs are
+// derived from the path and every blob is bound to its ID, so the contents are
+// re-encrypted under the new ID and the old blob is removed.
+int MoveFile(const std::string& src, const FileMetadata& src_meta, const std::string& dst) {
+    auto file = Acquire(src, src_meta);
+    if (int rc = EnsureLoaded(*file)) {
+        ReleaseRef(file);
+        return rc;
+    }
+
+    const std::string old_id = file->remote_id;
+    FileMetadata new_meta = src_meta;
+    new_meta.remote_id = g_ctx->codec->RemoteIdFor(dst);
+
+    g_ctx->index->Remove(src);
+    g_ctx->index->SetMetadata(dst, new_meta);
+    g_ctx->open_files.erase(src);
+    file->name = dst;
+    file->remote_id = new_meta.remote_id;
+    file->dirty = true;
+    g_ctx->open_files[dst] = file;
+
+    int rc = Persist(*file);
+    if (rc != 0) {
+        // Undo the in-memory move so the source is still intact.
+        g_ctx->index->Remove(dst);
+        g_ctx->index->SetMetadata(src, src_meta);
+        SaveIndex();
+        g_ctx->open_files.erase(dst);
+        file->name = src;
+        file->remote_id = old_id;
+        g_ctx->open_files[src] = file;
+    } else {
+        ::unlink(BlobPath(old_id).c_str());
+        g_ctx->cloud->QueueDelete(old_id);
+    }
+    ReleaseRef(file);
+    return rc;
+}
+
+// Move a directory and everything below it. Each file is re-encrypted under
+// its new path, so this costs time proportional to the subtree's size.
+int MoveDirectory(const std::string& src, const FileMetadata& src_meta, const std::string& dst) {
+    const std::vector<std::string> descendants = DescendantsOf(src);
+
+    g_ctx->index->SetMetadata(dst, src_meta);
+    for (const auto& old_name : descendants) {
+        const std::string new_name = dst + old_name.substr(src.size());
+        FileMetadata meta;
+        if (!g_ctx->index->GetMetadata(old_name, meta)) continue;
+        if (meta.IsDirectory()) {
+            g_ctx->index->Remove(old_name);
+            g_ctx->index->SetMetadata(new_name, meta);
+        } else if (int rc = MoveFile(old_name, meta, new_name)) {
+            // Partially moved: leave both trees in place (nothing is lost) and
+            // report the failure.
+            Log("rename '" + src + "' -> '" + dst + "' stopped at '" + old_name + "'");
+            SaveIndex();
+            return rc;
+        }
+    }
+    g_ctx->index->Remove(src);
+    return SaveIndex();
+}
+
 int encfs_rename(const char* from, const char* to, unsigned int flags) {
     return Guarded("rename", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
@@ -589,45 +751,25 @@ int encfs_rename(const char* from, const char* to, unsigned int flags) {
         FileMetadata src_meta, dst_meta;
         if (!g_ctx->index->GetMetadata(src, src_meta)) return -ENOENT;
         if (src == dst) return 0;
+        if (int rc = CheckParent(dst)) return rc;
         const bool dst_exists = g_ctx->index->GetMetadata(dst, dst_meta);
         if (dst_exists && (flags & RENAME_NOREPLACE)) return -EEXIST;
 
-        auto file = Acquire(src, src_meta);
-        if (int rc = EnsureLoaded(*file)) {
-            ReleaseRef(file);
-            return rc;
+        if (src_meta.IsDirectory()) {
+            if (dst.compare(0, src.size() + 1, src + "/") == 0) return -EINVAL;  // into itself
+            if (dst_exists) {
+                if (!dst_meta.IsDirectory()) return -ENOTDIR;
+                if (!DescendantsOf(dst).empty()) return -ENOTEMPTY;
+                g_ctx->index->Remove(dst);
+            }
+            return MoveDirectory(src, src_meta, dst);
         }
 
-        if (dst_exists) RemoveFile(dst, dst_meta);
-
-        const std::string old_id = file->remote_id;
-        FileMetadata new_meta = src_meta;
-        new_meta.remote_id = g_ctx->codec->RemoteIdFor(dst);
-
-        g_ctx->index->Remove(src);
-        g_ctx->index->SetMetadata(dst, new_meta);
-        g_ctx->open_files.erase(src);
-        file->name = dst;
-        file->remote_id = new_meta.remote_id;
-        file->dirty = true;
-        g_ctx->open_files[dst] = file;
-
-        int rc = Persist(*file);
-        if (rc != 0) {
-            // Undo the in-memory move so the source is still intact.
-            g_ctx->index->Remove(dst);
-            g_ctx->index->SetMetadata(src, src_meta);
-            SaveIndex();
-            g_ctx->open_files.erase(dst);
-            file->name = src;
-            file->remote_id = old_id;
-            g_ctx->open_files[src] = file;
-        } else {
-            ::unlink(BlobPath(old_id).c_str());
-            g_ctx->cloud->QueueDelete(old_id);
+        if (dst_exists) {
+            if (dst_meta.IsDirectory()) return -EISDIR;
+            RemoveFile(dst, dst_meta);
         }
-        ReleaseRef(file);
-        return rc;
+        return MoveFile(src, src_meta, dst);
     });
 }
 
@@ -700,6 +842,8 @@ struct fuse_operations MakeOperations() {
     ops.fsync = encfs_fsync;
     ops.release = encfs_release;
     ops.unlink = encfs_unlink;
+    ops.mkdir = encfs_mkdir;
+    ops.rmdir = encfs_rmdir;
     ops.rename = encfs_rename;
     ops.utimens = encfs_utimens;
     ops.chmod = encfs_chmod;

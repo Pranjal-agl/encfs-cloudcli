@@ -26,6 +26,8 @@ static void PrintUsage(const char* prog) {
         "Usage: " << prog << " [options] <backing_dir> <plaintext_name> <output_path|->\n"
         "       " << prog << " [options] --list <backing_dir>\n"
         "\n"
+        "<plaintext_name> is the path inside the filesystem, e.g. docs/notes.txt\n"
+        "\n"
         "Options:\n"
         "  -k, --key FILE      key file (default: $ENCFS_KEY_FILE or ~/.encfs/key)\n"
         "  -p, --passphrase    derive the key from a passphrase\n"
@@ -110,7 +112,11 @@ int main(int argc, char* argv[]) {
         for (const auto& name : names) {
             FileMetadata meta;
             index.GetMetadata(name, meta);
-            std::cout << meta.size << "\t" << name << "\n";
+            if (meta.IsDirectory()) {
+                std::cout << "-\t" << name << "/\n";
+            } else {
+                std::cout << meta.size << "\t" << name << "\n";
+            }
         }
         return 0;
     }
@@ -121,6 +127,10 @@ int main(int argc, char* argv[]) {
     FileMetadata meta;
     if (!index.GetMetadata(plaintext_name, meta)) {
         std::cerr << "File not found in index: " << plaintext_name << "\n";
+        return 1;
+    }
+    if (meta.IsDirectory()) {
+        std::cerr << plaintext_name << " is a directory\n";
         return 1;
     }
 

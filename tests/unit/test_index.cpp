@@ -183,6 +183,33 @@ void TestUnicodeAndOddNames() {
     for (const auto& n : names) CHECK(reloaded.Exists(n));
 }
 
+void TestDirectoryEntries() {
+    TempDir dir;
+    EncryptedIndex index(dir.path(), kKey);
+    FileMetadata d1, d2;  // directories: no remote ID
+    index.SetMetadata("docs", d1);
+    index.SetMetadata("docs/old", d2);
+    index.SetMetadata("docs/a.txt", Meta("id-a", 1, 5));
+    CHECK(d1.IsDirectory());
+    CHECK(!Meta("x", 1, 0).IsDirectory());
+
+    // Directories don't occupy the reverse map, and removing one leaves the
+    // others (and files) alone.
+    std::string name;
+    CHECK(!index.GetPlaintextName("", name));
+    index.Remove("docs/old");
+    CHECK(index.Exists("docs"));
+    CHECK(index.GetPlaintextName("id-a", name) && name == "docs/a.txt");
+
+    CHECK(index.Save());
+    EncryptedIndex reloaded(dir.path(), kKey);
+    CHECK(reloaded.Load());
+    FileMetadata m;
+    CHECK(reloaded.GetMetadata("docs", m) && m.IsDirectory());
+    CHECK(reloaded.GetMetadata("docs/a.txt", m) && !m.IsDirectory());
+    CHECK(!reloaded.GetPlaintextName("", name));
+}
+
 } // namespace
 
 int main() {
@@ -195,5 +222,6 @@ int main() {
         {"Corrupt or malformed index rejected", TestCorruptIndexRejected},
         {"On-disk format is stable", TestOnDiskFormatIsStable},
         {"Unicode and unusual filenames", TestUnicodeAndOddNames},
+        {"Directory entries", TestDirectoryEntries},
     });
 }

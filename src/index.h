@@ -16,9 +16,14 @@ struct FileMetadata {
     int64_t mtime;
 
     FileMetadata() : version(1), size(0), mtime(0) {}
+
+    // Directories are stored as entries without a remote ID (no blob). This
+    // keeps the on-disk index format unchanged from earlier versions.
+    bool IsDirectory() const { return remote_id.empty(); }
 };
 
-// Encrypted index that maps plaintext filenames to remote IDs + metadata.
+// Encrypted index that maps plaintext paths (e.g. "docs/notes.txt", no leading
+// slash) to remote IDs + metadata.
 // Stored as `<backing_dir>/index.enc`. All methods are thread-safe.
 class EncryptedIndex {
 public:
