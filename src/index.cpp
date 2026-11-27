@@ -71,7 +71,7 @@ bool EncryptedIndex::Deserialize(const std::vector<uint8_t>& data, ForwardMap& f
         pos += 24;
 
         fwd[name] = meta;
-        rev[remote_id] = name;
+        if (!remote_id.empty()) rev[remote_id] = name;
     }
     return pos == data.size();
 }
@@ -132,11 +132,13 @@ bool EncryptedIndex::GetMetadata(const std::string& plaintext_name, FileMetadata
 void EncryptedIndex::SetMetadata(const std::string& plaintext_name, const FileMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto old_it = index_.find(plaintext_name);
-    if (old_it != index_.end()) {
+    if (old_it != index_.end() && !old_it->second.remote_id.empty()) {
         reverse_index_.erase(old_it->second.remote_id);
     }
     index_[plaintext_name] = metadata;
-    reverse_index_[metadata.remote_id] = plaintext_name;
+    if (!metadata.remote_id.empty()) {
+        reverse_index_[metadata.remote_id] = plaintext_name;  // directories have no ID
+    }
 }
 
 bool EncryptedIndex::GetPlaintextName(const std::string& remote_id, std::string& plaintext_name) {
@@ -153,7 +155,7 @@ void EncryptedIndex::Remove(const std::string& plaintext_name) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = index_.find(plaintext_name);
     if (it != index_.end()) {
-        reverse_index_.erase(it->second.remote_id);
+        if (!it->second.remote_id.empty()) reverse_index_.erase(it->second.remote_id);
         index_.erase(it);
     }
 }

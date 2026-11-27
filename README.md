@@ -18,7 +18,8 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — hex or raw key file, or a passphrase (PBKDF2-HMAC-SHA256, 600k iterations)
-- **Works with everyday tools** — append, partial overwrite, truncate, `mv`, `touch`, `cp -p`, `rsync`, `df`
+- **Directories** — `mkdir -p`, nested files, directory renames, `rm -r`, with every path name kept private
+- **Works with everyday tools** — append, partial overwrite, truncate, `mv`, `touch`, `cp -rp`, `tar`, `rsync -a`, `find`, `df`
 
 ---
 
@@ -34,6 +35,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 │           encrypted_cloudfs.cpp             │
 │  getattr readdir open create read write     │
 │  truncate flush fsync release unlink rename │
+│  mkdir rmdir                                │
 │  utimens chmod chown statfs                 │
 │  (shared per-file buffers, one big lock)    │
 └──────┬──────────────┬───────────────┬───────┘
@@ -79,7 +81,7 @@ Blobs written by v1 are still readable and are rewritten as v2 the next time the
 
 ### Index format
 
-`index.enc` holds, per file: plaintext name, remote ID, version counter, size and mtime. It is serialized little-endian, then encrypted with AES-256-GCM under the index key. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
+`index.enc` holds, per entry: plaintext path (e.g. `docs/notes.txt`), remote ID, version counter, size and mtime. Directories are entries with an empty remote ID, so they need no blob and the format is unchanged from v1. It is serialized little-endian, then encrypted with AES-256-GCM under the index key. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
 
 ### Restoring on a new machine
 
@@ -191,12 +193,13 @@ CI runs everything, including the FUSE tests, in Release and in ASan/UBSan build
 - Keep the key file at mode `0600`; the tools warn if it's readable by others.
 - Plaintext filenames and contents never appear in cloud storage or the backing directory.
 - What *is* visible to the cloud: the number of files, their approximate sizes, and when they change.
-- Remote IDs are deterministic per name, so re-creating a deleted file with the same name reuses its remote ID. This is what lets you recover a file by name without the index.
+- Remote IDs are deterministic per path, so re-creating a deleted file at the same path reuses its remote ID. This is what lets you recover a file by its path without the index.
 - Key material and decrypted buffers are wiped (`OPENSSL_cleanse`) when no longer needed.
 
 ## Limitations
 
-- **Flat namespace**: there are no subdirectories.
+- **Directory operations scale with the tree**: listing a directory scans the whole index. Renaming a directory re-encrypts every file below it, because remote IDs are derived from full paths. Both are fine for thousands of files, but not millions.
+- **No symlinks or hard links.**
 - **Whole-file buffering**: an open file is held in memory (capped at 4 GiB per file), and each save re-encrypts the whole file.
 - **Single writer**: don't mount the same cloud store from two machines at once. Each machine's index would overwrite the other's.
 - **Permissions aren't stored**: everything belongs to the mounting user. `chmod`/`chown` are accepted but ignored.
@@ -210,13 +213,19 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ## Roadmap
 
-- Subdirectory support (the namespace is currently flat)
 - Chunk-level reads and writes, so large files aren't buffered whole
 - Optional filename padding to hide size/length patterns
 
 ---
 
 ## Changelog
+
+### v2.2 — subdirectories
+
+- `mkdir`, `rmdir`, nested files, and renaming directories, including moving files between them.
+- Path components are validated, `..` is rejected, and errors follow POSIX: `ENOTDIR`, `EISDIR`, `ENOTEMPTY`, `EINVAL` for moving a directory into itself.
+- `decrypt_by_name` takes paths and lists directories.
+- New end-to-end tests: directory trees, renames, persistence, `rm -r`, and no orphaned blobs. Also checked by hand with `tar`, `cp -r` and `rsync -a`.
 
 ### v2.1 — restore from the cloud
 

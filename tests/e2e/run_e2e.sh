@@ -121,7 +121,6 @@ check "rm"                      [ ! -e "$MNT/gone.txt" ]
 check "readdir lists files" \
     [ "$(find "$MNT" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = "big.bin c.txt empty hello.txt rw-copy.bin rw.bin " ]
 
-check_fails "nested paths rejected" mkdir "$MNT/dir" 2>/dev/null
 
 # ── Nothing leaks in plaintext ──
 check "no plaintext names/data in backing dir" \
@@ -206,7 +205,7 @@ touch "$WORK/cloud_down"
 CLOUDCLI="$FLAKY"
 mount_fs || fail "mount while cloud is down"
 rm "$WORK/cloud_down"
-check_fails "write refused when a cloud index exists" bash -c "echo x > '$MNT/new.txt' 2>/dev/null"
+check_fails "write refused when a cloud index exists" bash -c "echo x > '$MNT/new.txt'" 2>/dev/null
 unmount_fs
 check "cloud index left untouched"   [ "$(md5sum < "$ENCFS_STUB_STORE/index")" = "$CLOUD_INDEX_SUM" ]
 check "no stale local index kept"    [ ! -e "$BACK/index.enc" ]
@@ -214,6 +213,39 @@ mount_fs || fail "remount after cloud recovers"
 check "remount restores the real index" [ "$(cat "$MNT/c.txt")" = "moving" ]
 unmount_fs
 CLOUDCLI="$STUB"
+
+# ── Subdirectories ──
+mount_fs || fail "mount for directory tests"
+mkdir -p "$MNT/proj/src/deep"
+echo "main" > "$MNT/proj/src/main.c"
+echo "deep" > "$MNT/proj/src/deep/x.txt"
+echo "readme" > "$MNT/proj/README"
+check "mkdir -p and nested files"      [ "$(cat "$MNT/proj/src/deep/x.txt")" = "deep" ]
+check "stat reports a directory"       [ -d "$MNT/proj/src" ]
+check "readdir lists direct children"  [ "$(find "$MNT/proj" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = "README src " ]
+check "find walks the tree"            [ "$(find "$MNT/proj" -type f | wc -l)" = 3 ]
+check_fails "create in missing dir"    bash -c "echo x > '$MNT/nope/x'" 2>/dev/null
+check_fails "mkdir existing"           mkdir "$MNT/proj" 2>/dev/null
+check_fails "rmdir non-empty"          rmdir "$MNT/proj/src" 2>/dev/null
+check_fails "rm on a directory"        rm "$MNT/proj" 2>/dev/null
+check_fails "mv dir into itself"       mv "$MNT/proj" "$MNT/proj/src/" 2>/dev/null
+
+mv "$MNT/proj/src" "$MNT/proj/lib"
+check "mv directory moves contents"    [ "$(cat "$MNT/proj/lib/deep/x.txt")" = "deep" ]
+check "...old path gone"               [ ! -e "$MNT/proj/src" ]
+mv "$MNT/proj/README" "$MNT/proj/lib/deep/README"
+check "mv file between directories"    [ "$(cat "$MNT/proj/lib/deep/README")" = "readme" ]
+check "names stay private"             bash -c "! grep -rqa -e proj -e main.c -e deep '$BACK'"
+
+unmount_fs
+mount_fs || fail "remount for directory tests"
+check "tree persists across remount"   [ "$(cat "$MNT/proj/lib/main.c")" = "main" ]
+check "decrypt_by_name with a path" \
+    [ "$("$DECRYPT_BIN" -k "$KEY" "$BACK" proj/lib/deep/x.txt - 2>/dev/null)" = "deep" ]
+rm -r "$MNT/proj"
+check "rm -r removes the tree"         [ ! -e "$MNT/proj" ]
+unmount_fs
+check "no orphaned blobs in the cloud" [ "$(cloud_ids | wc -l)" = 6 ]
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
