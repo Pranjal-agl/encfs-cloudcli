@@ -4,6 +4,8 @@ A FUSE-based encrypted filesystem written in C++17. Files written to the mount p
 
 Built as a systems programming project to explore FUSE internals, OpenSSL cryptography, and concurrent C++.
 
+**[Try it in your browser](https://pranjal-agl.github.io/encfs-cloudcli/)** Watch a file get encrypted byte by byte, try to forge it, or recover files from a backing folder without installing anything. Everything runs locally, and the page is technically unable to make network requests.
+
 ---
 
 ## Features
@@ -100,6 +102,19 @@ Every write increments the file's version in the index and binds the new version
 - one version *ahead* of the index: accepted, and the index is repaired (this means we crashed after writing the blob but before saving the index);
 - an older version of the same file: rejected as a rollback (for example a stale copy served by the cloud);
 - anything else: rejected as corrupt or tampered.
+
+---
+
+## In the browser
+
+[`web/`](web/) is a static page, published to GitHub Pages, built on [`web/encfs.js`](web/encfs.js): a WebCrypto implementation of the key, index and blob formats (v1 and v2, version rules, passphrase KDF).
+
+- **Live blob:** type text, see the exact bytes of its encrypted blob colour-coded by region, then try to forge it. You can flip any bit, drop or swap chunks, present it as another file, or serve an older version, and each attempt is rejected with the reason.
+- **Recover files:** choose a backing folder (or files fetched from the cloud) and a key file, hex key or passphrase. You can then browse the tree, check every file, and save any of them.
+
+A Content-Security-Policy forbids the page from making any network connection, so keys and files can't leave the browser. `tests/web/` cross-checks `encfs.js` against the C++ code in both directions on every CI run: C++-written legacy, rollback and swapped blobs are read by JS, and JS-written blobs and indexes are read by C++.
+
+To run it locally, use `python3 -m http.server -d web`. ES modules need HTTP, not `file://`.
 
 ---
 
@@ -222,6 +237,11 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v2.4 — in the browser
+
+- `web/`: an interactive blob explainer and a client-side recovery tool, deployed to GitHub Pages.
+- `web/encfs.js`: an independent WebCrypto implementation of the formats, cross-checked against C++ in CI.
 
 ### v2.3 — random-access reads
 

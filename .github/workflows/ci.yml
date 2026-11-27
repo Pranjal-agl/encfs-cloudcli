@@ -46,7 +46,11 @@ jobs:
     - name: Build
       run: cmake --build build -j"$(nproc)"
 
-    - name: Test (unit, integration, FUSE end-to-end)
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Test (unit, integration, FUSE end-to-end, browser cross-check)
       run: ctest --test-dir build --output-on-failure
 
   shellcheck:
@@ -54,4 +58,4 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Lint shell scripts
-      run: shellcheck tools/cloudcli_stub tests/e2e/run_e2e.sh run_and_prove.sh
+      run: shellcheck tools/cloudcli_stub tests/e2e/run_e2e.sh tests/web/run_cross_check.sh run_and_prove.sh
