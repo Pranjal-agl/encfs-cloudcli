@@ -2,6 +2,7 @@
 #include <fuse3/fuse.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -47,18 +48,41 @@ const char kCloudIndexId[] = "index";
 const char kCloudKdfId[] = "encfs.kdf";
 
 
+// ── Locking ─────────────────────────────────────────────────────────────────
+// FUSE calls us from several threads. Locks, outermost first:
+//
+//   1. Context::mutex   the namespace: open_files, handles, refcounts, and every
+//                       operation that adds, removes or renames entries. Held
+//                       briefly, except by rename (which re-encrypts).
+//   2. OpenFile::mu     one file's contents. Downloads, reads, writes and saves
+//                       run under this alone, so a slow file blocks nobody else.
+//   3. leaf locks       EncryptedIndex's, synced_mutex, guard_mutex, and the
+//                       cloud wrapper's. Holders take no other lock.
+//
+// A thread may take a lock only if it holds none further down the list: in
+// particular, code holding a file lock never takes the namespace lock.
+// unlink/rename take a file's lock (under the namespace lock) to mark it
+// deleted or moved, which also makes them wait for a save in progress.
+
 // Plaintext of a file that's currently open. Every handle for the same file
 // shares one OpenFile, so concurrent readers/writers see a consistent view.
 struct OpenFile {
+    std::mutex mu;
+    // Changed only by rename, which holds both the namespace lock and `mu`.
     std::string name;
     std::string remote_id;
-    // Chunk-level view of the contents (null until first needed). Reads and
-    // writes use bounded memory whatever the file's size.
+    // Guarded by `mu`. Chunk-level view of the contents (null until first
+    // needed); bounded memory whatever the file's size.
     std::unique_ptr<FileContents> contents;
-    int64_t mtime = 0;
-    bool dirty = false;    // contents differ from what's on disk
-    bool deleted = false;  // unlinked while open; never write it back
-    int refs = 0;
+    bool dirty = false;  // contents differ from what's on disk
+
+    // Readable without `mu` (getattr holds only the namespace lock).
+    std::atomic<bool> deleted{false};  // unlinked while open; never write back
+    std::atomic<bool> loaded{false};   // `contents` exists; size_hint is current
+    std::atomic<uint64_t> size_hint{0};
+    std::atomic<int64_t> mtime{0};
+
+    int refs = 0;  // guarded by the namespace lock
 };
 
 struct Handle {
@@ -83,20 +107,25 @@ struct Context {
     // Set when we started with a brand-new index because none could be found
     // locally or downloaded. Before the first upload we check the cloud again,
     // so a transient download failure can't make us replace a real index.
-    bool index_guard_pending = false;
+    // guard_mutex makes every SaveIndex wait for that check.
+    std::atomic<bool> index_guard_pending{false};
+    std::mutex guard_mutex;
     // Set if that check found an existing cloud index: we refuse all writes
     // until the user remounts (and the index is restored).
-    bool read_only = false;
+    std::atomic<bool> read_only{false};
 
     // Local cache limit for blobs (0 = keep everything). See EnforceCacheLimit.
     uint64_t cache_limit = 0;
     // remote ID → the file version the cloud is known to hold (confirmed by a
     // finished upload or a verified download). Persisted in synced.list.
-    std::unordered_map<std::string, uint64_t> synced;
+    std::unordered_map<std::string, uint64_t> synced;  // guarded by synced_mutex
     bool synced_dirty = false;
+    std::mutex synced_mutex;
+    // Set by code that can't take the namespace lock; the cache limit is then
+    // enforced once that code has released its file lock.
+    std::atomic<bool> cache_check_pending{false};
 
-    // One lock around all filesystem state. FUSE runs us single-threaded
-    // (-s), so this costs nothing today but keeps us correct if that changes.
+    // The namespace lock (see "Locking" above).
     std::mutex mutex;
 };
 
@@ -211,6 +240,13 @@ std::unique_ptr<FileContents> NewContents(std::unique_ptr<ChunkedReader> base) {
     return std::make_unique<FileContents>(std::move(base), chunk, g_ctx->backing_dir);
 }
 
+// Publish size/state for getattr, which reads them without the file lock.
+// Caller holds file.mu.
+void Publish(OpenFile& file) {
+    file.size_hint = file.contents ? file.contents->size() : 0;
+    file.loaded = file.contents != nullptr;
+}
+
 // Make a file's contents available: a chunk-level view over its blob
 // (downloading the blob first if it isn't cached). Legacy v1 blobs, which
 // have no random access, are decrypted once and copied into the view.
@@ -283,7 +319,7 @@ int OpenContents(OpenFile& file) {
             // Verified, so the cloud holds exactly this version.
             FileMetadata now;
             if (g_ctx->index->GetMetadata(file.name, now)) MarkSynced(now.remote_id, now.version);
-            EnforceCacheLimit();
+            g_ctx->cache_check_pending = true;  // can't take the namespace lock here
         } else {
             ::unlink(source.c_str());
         }
@@ -291,18 +327,22 @@ int OpenContents(OpenFile& file) {
         TouchBlob(path);
     }
     if (rc != 0) file.contents.reset();
+    Publish(file);
     return rc;
 }
 
-// Start the file over as empty, without reading what was there.
+// Start the file over as empty, without reading what was there. Caller holds
+// file.mu.
 void ResetContents(OpenFile& file) {
     if (file.contents) {
         file.contents->Truncate(0);
     } else {
         file.contents = NewContents(nullptr);
     }
+    Publish(file);
 }
 
+// Caller holds the namespace lock.
 std::shared_ptr<OpenFile> Acquire(const std::string& name, const FileMetadata& meta) {
     auto it = g_ctx->open_files.find(name);
     if (it != g_ctx->open_files.end() && !it->second->deleted) {
@@ -318,17 +358,20 @@ std::shared_ptr<OpenFile> Acquire(const std::string& name, const FileMetadata& m
     return file;
 }
 
+// Caller holds the namespace lock (and not file->mu).
 void ReleaseRef(const std::shared_ptr<OpenFile>& file) {
     if (--file->refs > 0) return;
     auto it = g_ctx->open_files.find(file->name);
     if (it != g_ctx->open_files.end() && it->second == file) {
         g_ctx->open_files.erase(it);
     }
+    std::lock_guard<std::mutex> file_lock(file->mu);
     file->contents.reset();  // wipes cached chunks, drops the scratch file
+    Publish(*file);
 }
 
 // Encrypt and write back a dirty file (streaming, chunk by chunk), update the
-// index, and queue the upload.
+// index, and queue the upload. Caller holds file.mu (only).
 int Persist(OpenFile& file) {
     if (!file.dirty || file.deleted) return 0;
     if (g_ctx->read_only) return -EROFS;
@@ -370,7 +413,7 @@ int Persist(OpenFile& file) {
     meta.remote_id = file.remote_id;
     meta.version = version;
     meta.size = file.contents->size();
-    meta.mtime = file.mtime;
+    meta.mtime = file.mtime.load();
     g_ctx->index->SetMetadata(file.name, meta);
     if (int rc = SaveIndex()) {
         // The blob is now one version ahead of the saved index; reads accept
@@ -379,24 +422,29 @@ int Persist(OpenFile& file) {
     }
 
     file.dirty = false;
+    Publish(file);
     g_ctx->cloud->QueueUpload(path);
-    EnforceCacheLimit();
+    g_ctx->cache_check_pending = true;
     return 0;
 }
 
 // Remove a file's index entry, local blob and (in the background) cloud copy.
+// Caller holds the namespace lock.
 void RemoveFile(const std::string& name, const FileMetadata& meta) {
+    auto open = g_ctx->open_files.find(name);
+    if (open != g_ctx->open_files.end()) {
+        // Taking the file lock waits out a save in progress, so it can't
+        // write the file back after we've removed it.
+        std::lock_guard<std::mutex> file_lock(open->second->mu);
+        open->second->deleted = true;  // open handles keep their in-memory view
+    }
     g_ctx->index->Remove(name);
     SaveIndex();
     Unsync(meta.remote_id);
     ::unlink(BlobPath(meta.remote_id).c_str());
     g_ctx->cloud->QueueDelete(meta.remote_id);
 
-    auto it = g_ctx->open_files.find(name);
-    if (it != g_ctx->open_files.end()) {
-        it->second->deleted = true;  // open handles keep their in-memory view
-        g_ctx->open_files.erase(it);
-    }
+    if (open != g_ctx->open_files.end()) g_ctx->open_files.erase(open);
 }
 
 Handle* FindHandle(struct fuse_file_info* fi) {
@@ -412,6 +460,10 @@ int64_t Now() {
 // Save the index locally and queue its upload, so the cloud copy is enough to
 // restore the filesystem (with the key) on another machine.
 int SaveIndex() {
+    // Serialises with the first-save cloud check below, so no other save can
+    // queue an index upload before that check has finished.
+    std::lock_guard<std::mutex> guard(g_ctx->guard_mutex);
+    if (g_ctx->read_only) return -EROFS;
     if (!g_ctx->index->Save()) {
         Log("failed to save index");
         return -EIO;
@@ -448,6 +500,7 @@ int SaveIndex() {
 std::string SyncedPath() { return g_ctx->backing_dir + "/synced.list"; }
 
 void LoadSynced() {
+    std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
     std::vector<uint8_t> data;
     if (!ReadWholeFile(SyncedPath(), data)) return;
     std::string text(data.begin(), data.end());
@@ -462,6 +515,7 @@ void LoadSynced() {
 }
 
 void SaveSynced() {
+    std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
     if (!g_ctx->synced_dirty || g_ctx->cache_limit == 0) return;
     std::string text;
     for (const auto& [id, version] : g_ctx->synced) text += id + " " + std::to_string(version) + "\n";
@@ -471,6 +525,7 @@ void SaveSynced() {
 }
 
 void MarkSynced(const std::string& id, uint64_t version) {
+    std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
     auto it = g_ctx->synced.find(id);
     if (it != g_ctx->synced.end() && it->second == version) return;
     g_ctx->synced[id] = version;
@@ -478,6 +533,7 @@ void MarkSynced(const std::string& id, uint64_t version) {
 }
 
 void Unsync(const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
     if (g_ctx->synced.erase(id)) g_ctx->synced_dirty = true;
 }
 
@@ -496,8 +552,18 @@ bool IsBlobName(const std::string& n) {
            n.find_first_not_of("0123456789abcdef") == 64;
 }
 
+bool SyncedVersion(const std::string& id, uint64_t* version) {
+    std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
+    auto it = g_ctx->synced.find(id);
+    if (it == g_ctx->synced.end()) return false;
+    *version = it->second;
+    return true;
+}
+
+// Caller holds the namespace lock.
 void EnforceCacheLimit() {
     if (g_ctx->cache_limit == 0) return;
+    g_ctx->cache_check_pending = false;
 
     struct Blob { std::string id; uint64_t bytes; struct timespec used; };
     std::vector<Blob> blobs;
@@ -526,16 +592,24 @@ void EnforceCacheLimit() {
         if (total <= g_ctx->cache_limit) break;
         std::string name;
         FileMetadata meta;
-        auto synced = g_ctx->synced.find(blob.id);
-        if (synced == g_ctx->synced.end() || open_ids.count(blob.id) ||
+        uint64_t synced_version = 0;
+        if (!SyncedVersion(blob.id, &synced_version) || open_ids.count(blob.id) ||
             !g_ctx->index->GetPlaintextName(blob.id, name) ||
-            !g_ctx->index->GetMetadata(name, meta) || meta.version != synced->second ||
+            !g_ctx->index->GetMetadata(name, meta) || meta.version != synced_version ||
             g_ctx->cloud->IsPending(blob.id)) {
             continue;  // not provably safe in the cloud
         }
         if (::unlink(BlobPath(blob.id).c_str()) == 0) total -= blob.bytes;
     }
     SaveSynced();
+}
+
+// For code that just released a file lock: enforce the cache limit if
+// something asked for it while the namespace lock couldn't be taken.
+void MaybeEnforceCacheLimit() {
+    if (g_ctx->cache_limit == 0 || !g_ctx->cache_check_pending) return;
+    std::lock_guard<std::mutex> lock(g_ctx->mutex);
+    EnforceCacheLimit();
 }
 
 // Called by the sync worker after an upload finishes.
@@ -560,14 +634,15 @@ void ReconcileWithCloud() {
         FileMetadata meta;
         if (!g_ctx->index->GetMetadata(name, meta) || meta.IsDirectory()) continue;
         live.insert(meta.remote_id);
-        auto it = g_ctx->synced.find(meta.remote_id);
+        uint64_t synced_version = 0;
         const std::string path = BlobPath(meta.remote_id);
         struct stat st;
-        if ((it == g_ctx->synced.end() || it->second != meta.version) &&
+        if ((!SyncedVersion(meta.remote_id, &synced_version) || synced_version != meta.version) &&
             ::stat(path.c_str(), &st) == 0 && !g_ctx->cloud->IsPending(meta.remote_id)) {
             g_ctx->cloud->QueueUpload(path);
         }
     }
+    std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
     for (auto it = g_ctx->synced.begin(); it != g_ctx->synced.end();) {
         if (!live.count(it->first)) {
             it = g_ctx->synced.erase(it);
@@ -611,6 +686,7 @@ void encfs_destroy(void* private_data) {
     {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
         for (auto& [name, file] : g_ctx->open_files) {
+            std::lock_guard<std::mutex> file_lock(file->mu);
             Persist(*file);
         }
     }
@@ -654,8 +730,8 @@ int encfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) 
         uint64_t size = meta.size;
         int64_t mtime = meta.mtime;
         auto it = g_ctx->open_files.find(name);
-        if (it != g_ctx->open_files.end() && it->second->contents) {
-            size = it->second->contents->size();  // reflect unsaved writes
+        if (it != g_ctx->open_files.end() && it->second->loaded) {
+            size = it->second->size_hint;  // reflect unsaved writes
             mtime = it->second->mtime;
         }
 
@@ -700,39 +776,65 @@ int RegisterHandle(std::shared_ptr<OpenFile> file, bool writable, struct fuse_fi
     return 0;
 }
 
+// Handle lookup under the namespace lock; the returned shared_ptr keeps the
+// file alive after the lock is dropped.
+std::shared_ptr<OpenFile> HandleFile(struct fuse_file_info* fi, bool* writable = nullptr) {
+    std::lock_guard<std::mutex> lock(g_ctx->mutex);
+    Handle* h = FindHandle(fi);
+    if (!h) return nullptr;
+    if (writable) *writable = h->writable;
+    return h->file;
+}
+
 int encfs_open(const char* path, struct fuse_file_info* fi) {
     return Guarded("open", [&]() -> int {
-        std::lock_guard<std::mutex> lock(g_ctx->mutex);
-        std::string name;
-        if (int rc = NameFromPath(path, name)) return rc;
-        FileMetadata meta;
-        if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
-        if (meta.IsDirectory()) return -EISDIR;
-
         const bool writable = (fi->flags & O_ACCMODE) != O_RDONLY;
-        if (writable && g_ctx->read_only) return -EROFS;
-        auto file = Acquire(name, meta);
-
-        if (writable && (fi->flags & O_TRUNC)) {
-            ResetContents(*file);
-            file->dirty = true;
-            file->mtime = Now();
-        } else if (int rc = OpenContents(*file)) {
-            ReleaseRef(file);
-            return rc;
+        std::shared_ptr<OpenFile> file;
+        {
+            std::lock_guard<std::mutex> lock(g_ctx->mutex);
+            std::string name;
+            if (int rc = NameFromPath(path, name)) return rc;
+            FileMetadata meta;
+            if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+            if (meta.IsDirectory()) return -EISDIR;
+            if (writable && g_ctx->read_only) return -EROFS;
+            file = Acquire(name, meta);
         }
-        return RegisterHandle(std::move(file), writable, fi);
+
+        int rc = 0;
+        {
+            // Only this file is locked while its blob is downloaded/verified.
+            std::lock_guard<std::mutex> file_lock(file->mu);
+            if (writable && (fi->flags & O_TRUNC)) {
+                ResetContents(*file);
+                file->dirty = true;
+                file->mtime = Now();
+            } else {
+                rc = OpenContents(*file);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_ctx->mutex);
+            if (rc != 0) {
+                ReleaseRef(file);
+            } else {
+                RegisterHandle(std::move(file), writable, fi);
+            }
+        }
+        MaybeEnforceCacheLimit();
+        return rc;
     });
 }
 
 int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)mode;
     return Guarded("create", [&]() -> int {
+        // Namespace change: hold the namespace lock throughout.
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
         if (g_ctx->read_only) return -EROFS;
         std::string name;
         if (int rc = NameFromPath(path, name)) return rc;
-
         if (int rc = CheckParent(name)) return rc;
 
         FileMetadata meta;
@@ -751,11 +853,18 @@ int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
         }
 
         auto file = Acquire(name, meta);
-        if (!existed || (fi->flags & O_TRUNC)) {
-            ResetContents(*file);
-            file->dirty = true;  // ensure even an empty file gets a blob
-            file->mtime = Now();
-        } else if (int rc = OpenContents(*file)) {
+        int rc = 0;
+        {
+            std::lock_guard<std::mutex> file_lock(file->mu);
+            if (!existed || (fi->flags & O_TRUNC)) {
+                ResetContents(*file);
+                file->dirty = true;  // ensure even an empty file gets a blob
+                file->mtime = Now();
+            } else {
+                rc = OpenContents(*file);
+            }
+        }
+        if (rc != 0) {
             ReleaseRef(file);
             return rc;
         }
@@ -767,19 +876,23 @@ int encfs_read(const char* path, char* buf, size_t size, off_t offset,
                struct fuse_file_info* fi) {
     (void)path;
     return Guarded("read", [&]() -> int {
-        std::lock_guard<std::mutex> lock(g_ctx->mutex);
-        Handle* h = FindHandle(fi);
-        if (!h) return -EBADF;
         if (offset < 0) return -EINVAL;
-        OpenFile& file = *h->file;
-        if (int rc = OpenContents(file)) return rc;
-        int64_t n = file.contents->Read(static_cast<uint64_t>(offset),
-                                        reinterpret_cast<uint8_t*>(buf),
-                                        std::min<size_t>(size, INT_MAX));
+        auto file = HandleFile(fi);
+        if (!file) return -EBADF;
+
+        int64_t n;
+        {
+            std::lock_guard<std::mutex> file_lock(file->mu);
+            if (int rc = OpenContents(*file)) return rc;
+            n = file->contents->Read(static_cast<uint64_t>(offset),
+                                     reinterpret_cast<uint8_t*>(buf),
+                                     std::min<size_t>(size, INT_MAX));
+        }
         if (n < 0) {
-            Log("'" + file.name + "': chunk failed authentication");
+            Log("'" + file->name + "': chunk failed authentication");
             return -EIO;
         }
+        MaybeEnforceCacheLimit();
         return static_cast<int>(n);
     });
 }
@@ -788,65 +901,76 @@ int encfs_write(const char* path, const char* buf, size_t size, off_t offset,
                 struct fuse_file_info* fi) {
     (void)path;
     return Guarded("write", [&]() -> int {
-        std::lock_guard<std::mutex> lock(g_ctx->mutex);
-        Handle* h = FindHandle(fi);
-        if (!h || !h->writable) return -EBADF;
         if (offset < 0 || size > INT_MAX) return -EINVAL;
+        bool writable = false;
+        auto file = HandleFile(fi, &writable);
+        if (!file || !writable) return -EBADF;
 
-        OpenFile& file = *h->file;
-        if (int rc = OpenContents(file)) return rc;
+        std::lock_guard<std::mutex> file_lock(file->mu);
+        if (int rc = OpenContents(*file)) return rc;
         const uint64_t off = static_cast<uint64_t>(offset);
-        if (off > file.contents->max_size() || size > file.contents->max_size() - off) return -EFBIG;
-        if (!file.contents->Write(off, reinterpret_cast<const uint8_t*>(buf), size)) {
-            Log("'" + file.name + "': write failed (scratch space or authentication)");
+        if (off > file->contents->max_size() || size > file->contents->max_size() - off) return -EFBIG;
+        if (!file->contents->Write(off, reinterpret_cast<const uint8_t*>(buf), size)) {
+            Log("'" + file->name + "': write failed (scratch space or authentication)");
             return -EIO;
         }
-        file.dirty = true;
-        file.mtime = Now();
+        file->dirty = true;
+        file->mtime = Now();
+        Publish(*file);
         return static_cast<int>(size);
     });
 }
 
 int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
     return Guarded("truncate", [&]() -> int {
-        std::lock_guard<std::mutex> lock(g_ctx->mutex);
         if (g_ctx->read_only) return -EROFS;
         if (size < 0) return -EINVAL;
 
         std::shared_ptr<OpenFile> file;
         bool temporary = false;
-        if (Handle* h = FindHandle(fi)) {
-            if (!h->writable) return -EBADF;
-            file = h->file;
-        } else {
-            std::string name;
-            if (int rc = NameFromPath(path, name)) return rc;
-            FileMetadata meta;
-            if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
-            if (meta.IsDirectory()) return -EISDIR;
-            file = Acquire(name, meta);
-            temporary = true;
+        {
+            std::lock_guard<std::mutex> lock(g_ctx->mutex);
+            if (Handle* h = FindHandle(fi)) {
+                if (!h->writable) return -EBADF;
+                file = h->file;
+            } else {
+                std::string name;
+                if (int rc = NameFromPath(path, name)) return rc;
+                FileMetadata meta;
+                if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
+                if (meta.IsDirectory()) return -EISDIR;
+                file = Acquire(name, meta);
+                temporary = true;
+            }
         }
 
         int rc = 0;
-        if (size == 0) {
-            ResetContents(*file);  // no need to read what we're discarding
-        } else {
-            rc = OpenContents(*file);
-        }
-        if (rc == 0) {
-            if (static_cast<uint64_t>(size) > file->contents->max_size()) {
-                rc = -EFBIG;
-            } else if (!file->contents->Truncate(static_cast<uint64_t>(size))) {
-                rc = -EIO;
+        {
+            std::lock_guard<std::mutex> file_lock(file->mu);
+            if (size == 0) {
+                ResetContents(*file);  // no need to read what we're discarding
             } else {
-                file->dirty = true;
-                file->mtime = Now();
-                // Path-based truncate has no close() to piggy-back on: save now.
-                if (temporary) rc = Persist(*file);
+                rc = OpenContents(*file);
+            }
+            if (rc == 0) {
+                if (static_cast<uint64_t>(size) > file->contents->max_size()) {
+                    rc = -EFBIG;
+                } else if (!file->contents->Truncate(static_cast<uint64_t>(size))) {
+                    rc = -EIO;
+                } else {
+                    file->dirty = true;
+                    file->mtime = Now();
+                    Publish(*file);
+                    // Path-based truncate has no close() to piggy-back on: save now.
+                    if (temporary) rc = Persist(*file);
+                }
             }
         }
-        if (temporary) ReleaseRef(file);
+        if (temporary) {
+            std::lock_guard<std::mutex> lock(g_ctx->mutex);
+            ReleaseRef(file);
+        }
+        MaybeEnforceCacheLimit();
         return rc;
     });
 }
@@ -854,11 +978,16 @@ int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
 int encfs_flush(const char* path, struct fuse_file_info* fi) {
     (void)path;
     return Guarded("flush", [&]() -> int {
-        std::lock_guard<std::mutex> lock(g_ctx->mutex);
-        Handle* h = FindHandle(fi);
-        if (!h) return -EBADF;
-        // Saving on flush means close() reports write errors to the caller.
-        return Persist(*h->file);
+        auto file = HandleFile(fi);
+        if (!file) return -EBADF;
+        int rc;
+        {
+            // Saving on flush means close() reports write errors to the caller.
+            std::lock_guard<std::mutex> file_lock(file->mu);
+            rc = Persist(*file);
+        }
+        MaybeEnforceCacheLimit();
+        return rc;
     });
 }
 
@@ -870,17 +999,26 @@ int encfs_fsync(const char* path, int datasync, struct fuse_file_info* fi) {
 int encfs_release(const char* path, struct fuse_file_info* fi) {
     (void)path;
     return Guarded("release", [&]() -> int {
-        std::lock_guard<std::mutex> lock(g_ctx->mutex);
-        auto it = g_ctx->handles.find(fi->fh);
-        if (it == g_ctx->handles.end()) return 0;
-        std::shared_ptr<OpenFile> file = std::move(it->second.file);
-        g_ctx->handles.erase(it);
-
-        if (int rc = Persist(*file)) {
-            Log("'" + file->name + "': changes could not be saved (" +
-                std::strerror(-rc) + ")");
+        std::shared_ptr<OpenFile> file;
+        {
+            std::lock_guard<std::mutex> lock(g_ctx->mutex);
+            auto it = g_ctx->handles.find(fi->fh);
+            if (it == g_ctx->handles.end()) return 0;
+            file = std::move(it->second.file);
+            g_ctx->handles.erase(it);
         }
-        ReleaseRef(file);
+        {
+            std::lock_guard<std::mutex> file_lock(file->mu);
+            if (int rc = Persist(*file)) {
+                Log("'" + file->name + "': changes could not be saved (" +
+                    std::strerror(-rc) + ")");
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_ctx->mutex);
+            ReleaseRef(file);
+        }
+        MaybeEnforceCacheLimit();
         return 0;
     });
 }
@@ -940,7 +1078,9 @@ int encfs_rmdir(const char* path) {
 // re-encrypted under the new ID and the old blob is removed.
 int MoveFile(const std::string& src, const FileMetadata& src_meta, const std::string& dst) {
     auto file = Acquire(src, src_meta);
+    std::unique_lock<std::mutex> file_lock(file->mu);  // waits out a save in progress
     if (int rc = OpenContents(*file)) {
+        file_lock.unlock();
         ReleaseRef(file);
         return rc;
     }
@@ -972,6 +1112,7 @@ int MoveFile(const std::string& src, const FileMetadata& src_meta, const std::st
         ::unlink(BlobPath(old_id).c_str());
         g_ctx->cloud->QueueDelete(old_id);
     }
+    file_lock.unlock();
     ReleaseRef(file);
     return rc;
 }
@@ -1025,14 +1166,18 @@ int encfs_rename(const char* from, const char* to, unsigned int flags) {
                 if (!DescendantsOf(dst).empty()) return -ENOTEMPTY;
                 g_ctx->index->Remove(dst);
             }
-            return MoveDirectory(src, src_meta, dst);
+            int rc = MoveDirectory(src, src_meta, dst);
+            EnforceCacheLimit();
+            return rc;
         }
 
         if (dst_exists) {
             if (dst_meta.IsDirectory()) return -EISDIR;
             RemoveFile(dst, dst_meta);
         }
-        return MoveFile(src, src_meta, dst);
+        int rc = MoveFile(src, src_meta, dst);
+        EnforceCacheLimit();
+        return rc;
     });
 }
 
@@ -1286,7 +1431,7 @@ int main(int argc, char* argv[]) {
         EnforceCacheLimit();
     }
 
-    std::vector<std::string> fuse_args = {argv[0], mount_point, "-s",
+    std::vector<std::string> fuse_args = {argv[0], mount_point,
                                           "-o", "fsname=encfs-cloudcli,subtype=encfs"};
     if (!background) fuse_args.push_back("-f");
     if (debug) fuse_args.push_back("-d");
