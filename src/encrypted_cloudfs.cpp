@@ -24,6 +24,7 @@
 #include "cloudcli_wrapper.h"
 #include "crypto.h"
 #include "file_codec.h"
+#include "file_contents.h"
 #include "index.h"
 #include "key_setup.h"
 #include "util.h"
@@ -41,22 +42,17 @@ namespace {
 const char kCloudIndexId[] = "index";
 const char kCloudKdfId[] = "encfs.kdf";
 
-// Largest file we'll hold in memory. Files are buffered whole while open, so
-// this bounds memory use from a single runaway writer.
-constexpr uint64_t kMaxFileSize = 4ULL * 1024 * 1024 * 1024;
 
 // Plaintext of a file that's currently open. Every handle for the same file
 // shares one OpenFile, so concurrent readers/writers see a consistent view.
 struct OpenFile {
     std::string name;
     std::string remote_id;
-    std::vector<uint8_t> data;
-    // Read-only access decrypts chunk by chunk through `reader`; the whole
-    // file is only loaded into `data` once something writes to it.
-    std::unique_ptr<ChunkedReader> reader;
+    // Chunk-level view of the contents (null until first needed). Reads and
+    // writes use bounded memory whatever the file's size.
+    std::unique_ptr<FileContents> contents;
     int64_t mtime = 0;
-    bool loaded = false;   // `data` holds the file's contents
-    bool dirty = false;    // `data` differs from what's on disk
+    bool dirty = false;    // contents differ from what's on disk
     bool deleted = false;  // unlinked while open; never write it back
     int refs = 0;
 };
@@ -195,10 +191,16 @@ int DecryptBlob(const std::string& name, FileMetadata meta,
     }
 }
 
-// Make a file readable: open a chunk-level reader over its blob (downloading
-// the blob first if it isn't cached), or for legacy v1 blobs decrypt it whole.
-int OpenForRead(OpenFile& file) {
-    if (file.loaded || file.reader) return 0;
+std::unique_ptr<FileContents> NewContents(std::unique_ptr<ChunkedReader> base) {
+    size_t chunk = base ? base->chunk_size() : g_ctx->codec->chunk_size();
+    return std::make_unique<FileContents>(std::move(base), chunk, g_ctx->backing_dir);
+}
+
+// Make a file's contents available: a chunk-level view over its blob
+// (downloading the blob first if it isn't cached). Legacy v1 blobs, which
+// have no random access, are decrypted once and copied into the view.
+int OpenContents(OpenFile& file) {
+    if (file.contents) return 0;
     FileMetadata meta;
     if (!g_ctx->index->GetMetadata(file.name, meta)) return -ENOENT;
 
@@ -212,8 +214,7 @@ int OpenForRead(OpenFile& file) {
         if (!g_ctx->cloud->Download(meta.remote_id, source)) {
             ::unlink(source.c_str());
             if (meta.size == 0) {  // older versions never wrote a blob for empty files
-                file.data.clear();
-                file.loaded = true;
+                file.contents = NewContents(nullptr);
                 return 0;
             }
             Log("'" + file.name + "': not cached locally and download failed");
@@ -228,22 +229,26 @@ int OpenForRead(OpenFile& file) {
     switch (g_ctx->codec->OpenReader(source, meta.remote_id, meta.version, &reader, &actual)) {
     case FileCodec::Result::kOk:
         if (!reader) {
-            // Legacy v1 blob (no random access): decrypt it in one go.
-            std::vector<uint8_t> blob;
-            rc = ReadWholeFile(source, blob) ? DecryptBlob(file.name, meta, blob, file.data) : -EIO;
-            if (rc == 0) file.loaded = true;
+            // Legacy v1 blob: decrypt it in one go, then hold it chunk-wise.
+            std::vector<uint8_t> blob, plain;
+            rc = ReadWholeFile(source, blob) ? DecryptBlob(file.name, meta, blob, plain) : -EIO;
+            if (rc == 0) {
+                file.contents = NewContents(nullptr);
+                if (!file.contents->Write(0, plain.data(), plain.size())) rc = -EIO;
+                SecureWipe(plain);
+            }
         } else if (actual != meta.version) {
             // Blob is one version ahead (crash before the index was saved).
             meta.version = actual;
             meta.size = reader->plaintext_size();
             g_ctx->index->SetMetadata(file.name, meta);
             SaveIndex();
-            file.reader = std::move(reader);
+            file.contents = NewContents(std::move(reader));
         } else if (reader->plaintext_size() != meta.size) {
             Log("'" + file.name + "': blob length doesn't match the index (truncated or extended)");
             rc = -EIO;
         } else {
-            file.reader = std::move(reader);
+            file.contents = NewContents(std::move(reader));
         }
         break;
     case FileCodec::Result::kRollback:
@@ -265,7 +270,17 @@ int OpenForRead(OpenFile& file) {
             ::unlink(source.c_str());
         }
     }
+    if (rc != 0) file.contents.reset();
     return rc;
+}
+
+// Start the file over as empty, without reading what was there.
+void ResetContents(OpenFile& file) {
+    if (file.contents) {
+        file.contents->Truncate(0);
+    } else {
+        file.contents = NewContents(nullptr);
+    }
 }
 
 std::shared_ptr<OpenFile> Acquire(const std::string& name, const FileMetadata& meta) {
@@ -289,54 +304,56 @@ void ReleaseRef(const std::shared_ptr<OpenFile>& file) {
     if (it != g_ctx->open_files.end() && it->second == file) {
         g_ctx->open_files.erase(it);
     }
-    SecureWipe(file->data);
+    file->contents.reset();  // wipes cached chunks, drops the scratch file
 }
 
-// Load the whole file into memory (needed before modifying it).
-int EnsureLoaded(OpenFile& file) {
-    if (file.loaded) return 0;
-    if (int rc = OpenForRead(file)) return rc;
-    if (file.loaded) return 0;  // legacy blob, already decrypted in full
-
-    const uint64_t size = file.reader->plaintext_size();
-    if (size > kMaxFileSize) return -EFBIG;
-    file.data.resize(static_cast<size_t>(size));
-    if (file.reader->ReadAt(0, file.data.data(), file.data.size()) != static_cast<int64_t>(size)) {
-        SecureWipe(file.data);
-        file.data.clear();
-        Log("'" + file.name + "': blob failed authentication while loading");
-        return -EIO;
-    }
-    file.reader.reset();
-    file.loaded = true;
-    return 0;
-}
-
-// Encrypt and write back a dirty file, update the index, queue the upload.
+// Encrypt and write back a dirty file (streaming, chunk by chunk), update the
+// index, and queue the upload.
 int Persist(OpenFile& file) {
     if (!file.dirty || file.deleted) return 0;
     if (g_ctx->read_only) return -EROFS;
+    if (int rc = OpenContents(file)) return rc;
 
     FileMetadata meta;
     if (!g_ctx->index->GetMetadata(file.name, meta)) return 0;  // removed meanwhile
 
     const uint64_t version = meta.version + 1;
-    std::vector<uint8_t> blob = g_ctx->codec->Encrypt(file.data, file.remote_id, version);
     const std::string path = BlobPath(file.remote_id);
-    if (!WriteFileAtomic(path, blob, 0600)) {
+    AtomicFile out(path, 0600);
+    bool ok = out.Open();
+    if (ok) {
+        auto writer = g_ctx->codec->NewWriter(
+            [&out](const uint8_t* d, size_t n) { return out.Write(d, n); },
+            file.remote_id, version, file.contents->chunk_size());
+        ok = file.contents->ForEachChunk([&](const uint8_t* d, size_t n, bool last) {
+                 return writer->Add(d, n, last);
+             }) &&
+             writer->finished() && out.Commit();
+    }
+    if (!ok) {
         int err = errno ? errno : EIO;
         Log("'" + file.name + "': cannot write " + path + ": " + std::strerror(err));
         return -err;
     }
 
+    // Read from the new blob from now on; the old one is gone.
+    std::unique_ptr<ChunkedReader> reader;
+    uint64_t actual = 0;
+    if (g_ctx->codec->OpenReader(path, file.remote_id, version, &reader, &actual) !=
+            FileCodec::Result::kOk || !reader) {
+        Log("'" + file.name + "': just-written blob does not verify");
+        return -EIO;
+    }
+    file.contents->Rebase(std::move(reader));
+
     meta.remote_id = file.remote_id;
     meta.version = version;
-    meta.size = file.data.size();
+    meta.size = file.contents->size();
     meta.mtime = file.mtime;
     g_ctx->index->SetMetadata(file.name, meta);
     if (int rc = SaveIndex()) {
-        // The blob is now one version ahead of the saved index; DecryptBlob
-        // accepts and repairs that on the next read.
+        // The blob is now one version ahead of the saved index; reads accept
+        // and repair that.
         return rc;
     }
 
@@ -451,8 +468,8 @@ int encfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) 
         uint64_t size = meta.size;
         int64_t mtime = meta.mtime;
         auto it = g_ctx->open_files.find(name);
-        if (it != g_ctx->open_files.end() && it->second->loaded) {
-            size = it->second->data.size();  // reflect unsaved writes
+        if (it != g_ctx->open_files.end() && it->second->contents) {
+            size = it->second->contents->size();  // reflect unsaved writes
             mtime = it->second->mtime;
         }
 
@@ -511,13 +528,10 @@ int encfs_open(const char* path, struct fuse_file_info* fi) {
         auto file = Acquire(name, meta);
 
         if (writable && (fi->flags & O_TRUNC)) {
-            file->data.clear();
-            file->loaded = true;
+            ResetContents(*file);
             file->dirty = true;
             file->mtime = Now();
-        } else if (int rc = writable ? EnsureLoaded(*file) : OpenForRead(*file)) {
-            // Writers load the whole file: without the existing contents,
-            // appends and partial overwrites would destroy the rest of it.
+        } else if (int rc = OpenContents(*file)) {
             ReleaseRef(file);
             return rc;
         }
@@ -552,11 +566,10 @@ int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
 
         auto file = Acquire(name, meta);
         if (!existed || (fi->flags & O_TRUNC)) {
-            file->data.clear();
-            file->loaded = true;
+            ResetContents(*file);
             file->dirty = true;  // ensure even an empty file gets a blob
             file->mtime = Now();
-        } else if (int rc = EnsureLoaded(*file)) {
+        } else if (int rc = OpenContents(*file)) {
             ReleaseRef(file);
             return rc;
         }
@@ -573,18 +586,10 @@ int encfs_read(const char* path, char* buf, size_t size, off_t offset,
         if (!h) return -EBADF;
         if (offset < 0) return -EINVAL;
         OpenFile& file = *h->file;
-        if (int rc = OpenForRead(file)) return rc;
-        size = std::min<size_t>(size, INT_MAX);
-
-        if (file.loaded) {
-            const auto& data = file.data;
-            if (static_cast<uint64_t>(offset) >= data.size()) return 0;
-            size_t n = std::min(size, data.size() - static_cast<size_t>(offset));
-            std::memcpy(buf, data.data() + offset, n);
-            return static_cast<int>(n);
-        }
-        int64_t n = file.reader->ReadAt(static_cast<uint64_t>(offset),
-                                        reinterpret_cast<uint8_t*>(buf), size);
+        if (int rc = OpenContents(file)) return rc;
+        int64_t n = file.contents->Read(static_cast<uint64_t>(offset),
+                                        reinterpret_cast<uint8_t*>(buf),
+                                        std::min<size_t>(size, INT_MAX));
         if (n < 0) {
             Log("'" + file.name + "': chunk failed authentication");
             return -EIO;
@@ -601,13 +606,15 @@ int encfs_write(const char* path, const char* buf, size_t size, off_t offset,
         Handle* h = FindHandle(fi);
         if (!h || !h->writable) return -EBADF;
         if (offset < 0 || size > INT_MAX) return -EINVAL;
-        if (static_cast<uint64_t>(offset) + size > kMaxFileSize) return -EFBIG;
 
         OpenFile& file = *h->file;
-        if (int rc = EnsureLoaded(file)) return rc;
-        size_t end = static_cast<size_t>(offset) + size;
-        if (file.data.size() < end) file.data.resize(end);
-        std::memcpy(file.data.data() + offset, buf, size);
+        if (int rc = OpenContents(file)) return rc;
+        const uint64_t off = static_cast<uint64_t>(offset);
+        if (off > file.contents->max_size() || size > file.contents->max_size() - off) return -EFBIG;
+        if (!file.contents->Write(off, reinterpret_cast<const uint8_t*>(buf), size)) {
+            Log("'" + file.name + "': write failed (scratch space or authentication)");
+            return -EIO;
+        }
         file.dirty = true;
         file.mtime = Now();
         return static_cast<int>(size);
@@ -619,7 +626,6 @@ int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
         if (g_ctx->read_only) return -EROFS;
         if (size < 0) return -EINVAL;
-        if (static_cast<uint64_t>(size) > kMaxFileSize) return -EFBIG;
 
         std::shared_ptr<OpenFile> file;
         bool temporary = false;
@@ -638,17 +644,21 @@ int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
 
         int rc = 0;
         if (size == 0) {
-            file->data.clear();
-            file->loaded = true;  // no need to decrypt what we're discarding
+            ResetContents(*file);  // no need to read what we're discarding
         } else {
-            rc = EnsureLoaded(*file);
+            rc = OpenContents(*file);
         }
         if (rc == 0) {
-            file->data.resize(static_cast<size_t>(size));
-            file->dirty = true;
-            file->mtime = Now();
-            // Path-based truncate has no close() to piggy-back on: save now.
-            if (temporary) rc = Persist(*file);
+            if (static_cast<uint64_t>(size) > file->contents->max_size()) {
+                rc = -EFBIG;
+            } else if (!file->contents->Truncate(static_cast<uint64_t>(size))) {
+                rc = -EIO;
+            } else {
+                file->dirty = true;
+                file->mtime = Now();
+                // Path-based truncate has no close() to piggy-back on: save now.
+                if (temporary) rc = Persist(*file);
+            }
         }
         if (temporary) ReleaseRef(file);
         return rc;
@@ -744,7 +754,7 @@ int encfs_rmdir(const char* path) {
 // re-encrypted under the new ID and the old blob is removed.
 int MoveFile(const std::string& src, const FileMetadata& src_meta, const std::string& dst) {
     auto file = Acquire(src, src_meta);
-    if (int rc = EnsureLoaded(*file)) {
+    if (int rc = OpenContents(*file)) {
         ReleaseRef(file);
         return rc;
     }

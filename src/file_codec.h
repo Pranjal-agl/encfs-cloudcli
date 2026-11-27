@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,6 +63,15 @@ public:
                       uint64_t expected_version,
                       std::unique_ptr<class ChunkedReader>* reader,
                       uint64_t* actual_version) const;
+
+    // Streaming encryptor for version `version` of `remote_id`, writing the
+    // blob through `write_fn`. `chunk_size` 0 means the codec's default.
+    std::unique_ptr<class ChunkedWriter> NewWriter(std::function<bool(const uint8_t*, size_t)> write_fn,
+                                                   const std::string& remote_id,
+                                                   uint64_t version,
+                                                   size_t chunk_size = 0) const;
+
+    size_t chunk_size() const { return chunk_size_; }
 
     // Chunk size for new blobs (tests use small values to exercise chunking).
     void set_chunk_size(size_t chunk_size) { chunk_size_ = chunk_size; }

@@ -17,7 +17,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Encrypted index** — the local name ↔ remote-ID mapping is itself AES-GCM encrypted
 - **Background sync** — uploads and deletes run in a worker thread with retries and exponential back-off; redundant operations are coalesced
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
-- **Random-access reads** — reading decrypts only the chunks you touch, with constant memory: `cat` of a 300 MB file peaks at 11 MB of RAM, where loading it whole took 580 MB
+- **Constant memory, any file size** — reads decrypt only the chunks they touch, and writes keep only a few chunks in RAM. Copying in a 1 GB file peaks at 21 MB, where buffering it whole took about 2 GB.
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — hex or raw key file, or a passphrase (PBKDF2-HMAC-SHA256, 600k iterations)
@@ -54,7 +54,17 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 └──────────────┘              └───────────────┘
 ```
 
-`key_setup.cpp` (key files / passphrases) and `util.cpp` (atomic file writes, little-endian encoding) are shared by the filesystem and the `decrypt_by_name` tool.
+`file_contents.cpp` holds an open file's contents in bounded memory, described in the next section. `key_setup.cpp` (key files and passphrases) and `util.cpp` (atomic file writes, little-endian encoding) are shared by the filesystem and the `decrypt_by_name` tool.
+
+### Open files in bounded memory
+
+An open file is a `FileContents` with three parts:
+
+1. **The current blob** (`ChunkedReader`): unmodified chunks are read from it and authenticated on demand.
+2. **A small cache** of chunks, 8 MiB per open file.
+3. **A scratch file** for modified chunks that don't fit in the cache. Each slot is sealed with AES-GCM under a random key that exists only in memory, with the chunk index as AAD. The file is unlinked the moment it's created (`O_TMPFILE` where available), so plaintext never reaches the disk and a crash leaves nothing behind.
+
+Saving streams every chunk, from cache, scratch or the old blob, through a `ChunkedWriter` into a new blob, with a fresh salt and the next version number. Then it switches to reading from the new blob. If an old chunk fails authentication while being copied, the save fails: tampered data is never re-encrypted as if it were genuine.
 
 ### Keys
 
@@ -222,7 +232,7 @@ CI runs everything, including the FUSE tests, in Release and in ASan/UBSan build
 
 - **Directory operations scale with the tree**: listing a directory scans the whole index. Renaming a directory re-encrypts every file below it, because remote IDs are derived from full paths. Both are fine for thousands of files, but not millions.
 - **No symlinks or hard links.**
-- **Writes buffer the whole file**: reads are chunk-by-chunk, but a file opened for writing is held in memory (capped at 4 GiB), and each save re-encrypts it.
+- **Each save rewrites the whole blob**: memory stays constant, but CPU and disk time are proportional to file size, and `cloudcli` uploads the whole blob. Small edits to very large files are therefore slow to sync.
 - **Single writer**: don't mount the same cloud store from two machines at once. Each machine's index would overwrite the other's.
 - **Permissions aren't stored**: everything belongs to the mounting user. `chmod`/`chown` are accepted but ignored.
 - **Rename isn't atomic across a crash**: it re-encrypts the file under the new name's ID before removing the old one, so a crash mid-rename can leave both copies.
@@ -235,12 +245,18 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ## Roadmap
 
-- Chunk-level writes (re-encrypt only modified chunks), which needs per-chunk versioning
+- Incremental saves: re-encrypt and upload only modified chunks. This would need per-chunk versioning in the format and a partial-upload operation in `cloudcli`.
 - Optional filename padding to hide size/length patterns
 
 ---
 
 ## Changelog
+
+### v2.6 — constant-memory writes
+
+- Files opened for writing no longer live in RAM. `FileContents` keeps a few chunks in memory and spills the rest to an encrypted, unlinked scratch file. On a 1 GB file, the copy-in peak dropped from 1,979 MB to 21 MB, and appending a line went from 4.6 s to 2.4 s at 13 MB. The 4 GiB file-size cap is gone.
+- Saves stream into the new blob through `ChunkedWriter` and `AtomicFile`, and refuse to re-seal a tampered source chunk.
+- New `test_contents` suite: thousands of random writes, truncates, reads and save-and-rebase cycles checked against an in-memory model, with a 2-chunk cache to force spilling. It also checks tamper handling, sparse files and the size limit.
 
 ### v2.5 — verify and export
 
