@@ -1,125 +1,107 @@
 #include "index.h"
 #include "crypto.h"
-#include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <cstring>
+#include "util.h"
+
+#include <cerrno>
+#include <sys/stat.h>
 
 namespace encfs {
+
+namespace {
+constexpr uint32_t kMaxNameLen = 1024 * 1024;
+constexpr uint32_t kMaxRemoteIdLen = 1024;
+} // namespace
 
 EncryptedIndex::EncryptedIndex(const std::string& backing_dir, const std::vector<uint8_t>& key)
     : index_path_(backing_dir + "/index.enc"), key_(key) {
 }
 
-std::vector<uint8_t> EncryptedIndex::DeriveIndexKey() {
-    // Derive a separate key for index encryption using HMAC
-    // Use a fixed context string to derive from master key
-    std::string context = "encfs_index_key_derivation";
-    return HMAC::Compute(key_, std::vector<uint8_t>(context.begin(), context.end()));
+std::vector<uint8_t> EncryptedIndex::DeriveIndexKey() const {
+    // Separate key for the index, derived from the master key.
+    return KeyManager::DeriveSubkey(key_, "encfs_index_key_derivation");
 }
 
-std::vector<uint8_t> EncryptedIndex::Serialize() {
-    std::ostringstream oss;
-    
-    // Format: number of entries (4 bytes) + entries
-    // Each entry: plaintext_len (4) + plaintext + remote_id_len (4) + remote_id + 
-    //             version (8) + size (8) + mtime (8)
-    uint32_t count = static_cast<uint32_t>(index_.size());
-    oss.write(reinterpret_cast<const char*>(&count), 4);
-    
-    for (const auto& pair : index_) {
-        const std::string& plaintext = pair.first;
-        const FileMetadata& meta = pair.second;
-        
-        uint32_t plaintext_len = static_cast<uint32_t>(plaintext.size());
-        oss.write(reinterpret_cast<const char*>(&plaintext_len), 4);
-        oss.write(plaintext.c_str(), plaintext_len);
-        
-        uint32_t remote_id_len = static_cast<uint32_t>(meta.remote_id.size());
-        oss.write(reinterpret_cast<const char*>(&remote_id_len), 4);
-        oss.write(meta.remote_id.c_str(), remote_id_len);
-        
-        oss.write(reinterpret_cast<const char*>(&meta.version), 8);
-        oss.write(reinterpret_cast<const char*>(&meta.size), 8);
-        oss.write(reinterpret_cast<const char*>(&meta.mtime), 8);
+// Format (all integers little-endian):
+//   count:u32, then per entry:
+//   name_len:u32 | name | remote_id_len:u32 | remote_id | version:u64 | size:u64 | mtime:i64
+std::vector<uint8_t> EncryptedIndex::Serialize() const {
+    std::vector<uint8_t> out;
+    AppendU32LE(out, static_cast<uint32_t>(index_.size()));
+    for (const auto& [name, meta] : index_) {
+        AppendU32LE(out, static_cast<uint32_t>(name.size()));
+        out.insert(out.end(), name.begin(), name.end());
+        AppendU32LE(out, static_cast<uint32_t>(meta.remote_id.size()));
+        out.insert(out.end(), meta.remote_id.begin(), meta.remote_id.end());
+        AppendU64LE(out, meta.version);
+        AppendU64LE(out, meta.size);
+        AppendU64LE(out, static_cast<uint64_t>(meta.mtime));
     }
-    
-    std::string data = oss.str();
-    return std::vector<uint8_t>(data.begin(), data.end());
+    return out;
 }
 
-bool EncryptedIndex::Deserialize(const std::vector<uint8_t>& data) {
-    if (data.size() < 4) {
-        return false;
-    }
-    
-    std::istringstream iss(std::string(data.begin(), data.end()));
-    
-    uint32_t count;
-    iss.read(reinterpret_cast<char*>(&count), 4);
-    if (iss.fail()) return false;
-    
-    index_.clear();
-    reverse_index_.clear();
-    
+bool EncryptedIndex::Deserialize(const std::vector<uint8_t>& data, ForwardMap& fwd, ReverseMap& rev) {
+    size_t pos = 0;
+    auto need = [&](size_t n) { return data.size() - pos >= n; };
+
+    if (!need(4)) return false;
+    uint32_t count = LoadU32LE(data.data());
+    pos += 4;
+
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t plaintext_len;
-        iss.read(reinterpret_cast<char*>(&plaintext_len), 4);
-        if (iss.fail() || plaintext_len > 1024 * 1024) return false; // Sanity check
-        
-        std::string plaintext(plaintext_len, '\0');
-        iss.read(&plaintext[0], plaintext_len);
-        if (iss.fail()) return false;
-        
-        uint32_t remote_id_len;
-        iss.read(reinterpret_cast<char*>(&remote_id_len), 4);
-        if (iss.fail() || remote_id_len > 1024) return false;
-        
-        std::string remote_id(remote_id_len, '\0');
-        iss.read(&remote_id[0], remote_id_len);
-        if (iss.fail()) return false;
-        
+        if (!need(4)) return false;
+        uint32_t name_len = LoadU32LE(data.data() + pos);
+        pos += 4;
+        if (name_len > kMaxNameLen || !need(name_len)) return false;
+        std::string name(data.begin() + pos, data.begin() + pos + name_len);
+        pos += name_len;
+
+        if (!need(4)) return false;
+        uint32_t id_len = LoadU32LE(data.data() + pos);
+        pos += 4;
+        if (id_len > kMaxRemoteIdLen || !need(id_len)) return false;
+        std::string remote_id(data.begin() + pos, data.begin() + pos + id_len);
+        pos += id_len;
+
+        if (!need(24)) return false;
         FileMetadata meta;
-        iss.read(reinterpret_cast<char*>(&meta.version), 8);
-        iss.read(reinterpret_cast<char*>(&meta.size), 8);
-        iss.read(reinterpret_cast<char*>(&meta.mtime), 8);
-        if (iss.fail()) return false;
-        
         meta.remote_id = remote_id;
-        index_[plaintext] = meta;
-        reverse_index_[remote_id] = plaintext;
+        meta.version = LoadU64LE(data.data() + pos);
+        meta.size = LoadU64LE(data.data() + pos + 8);
+        meta.mtime = static_cast<int64_t>(LoadU64LE(data.data() + pos + 16));
+        pos += 24;
+
+        fwd[name] = meta;
+        rev[remote_id] = name;
     }
-    
-    return true;
+    return pos == data.size();
+}
+
+bool EncryptedIndex::FileExists() const {
+    struct stat st;
+    return ::stat(index_path_.c_str(), &st) == 0;
 }
 
 bool EncryptedIndex::Load() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::ifstream file(index_path_, std::ios::binary);
-    if (!file) {
-        // Index doesn't exist yet, start empty
+
+    std::vector<uint8_t> encrypted;
+    if (!ReadWholeFile(index_path_, encrypted)) {
+        return errno == ENOENT;  // no index yet → start empty
+    }
+    if (encrypted.empty()) {
         return true;
     }
-    
-    file.seekg(0, std::ios::end);
-    size_t file_size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    
-    if (file_size == 0) {
-        return true; // Empty index
-    }
-    
-    std::vector<uint8_t> encrypted_data(file_size);
-    file.read(reinterpret_cast<char*>(encrypted_data.data()), file_size);
-    if (file.fail()) {
-        return false;
-    }
-    
+
     try {
-        std::vector<uint8_t> index_key = DeriveIndexKey();
-        std::vector<uint8_t> decrypted_data = SimpleCrypto::Decrypt(encrypted_data, index_key);
-        return Deserialize(decrypted_data);
+        std::vector<uint8_t> plain = SimpleCrypto::Decrypt(encrypted, DeriveIndexKey());
+        ForwardMap fwd;
+        ReverseMap rev;
+        bool ok = Deserialize(plain, fwd, rev);
+        SecureWipe(plain);
+        if (!ok) return false;
+        index_.swap(fwd);
+        reverse_index_.swap(rev);
+        return true;
     } catch (const std::exception&) {
         return false;
     }
@@ -127,33 +109,11 @@ bool EncryptedIndex::Load() {
 
 bool EncryptedIndex::Save() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::vector<uint8_t> serialized = Serialize();
-    std::vector<uint8_t> index_key = DeriveIndexKey();
-    
     try {
-        std::vector<uint8_t> encrypted_data = SimpleCrypto::Encrypt(serialized, index_key);
-        
-        // Write to temp file first, then rename (atomic)
-        std::string temp_path = index_path_ + ".tmp";
-        std::ofstream file(temp_path, std::ios::binary);
-        if (!file) {
-            return false;
-        }
-        
-        file.write(reinterpret_cast<const char*>(encrypted_data.data()), encrypted_data.size());
-        file.close();
-        
-        if (file.fail()) {
-            return false;
-        }
-        
-        // Atomic rename
-        if (rename(temp_path.c_str(), index_path_.c_str()) != 0) {
-            return false;
-        }
-        
-        return true;
+        std::vector<uint8_t> plain = Serialize();
+        std::vector<uint8_t> encrypted = SimpleCrypto::Encrypt(plain, DeriveIndexKey());
+        SecureWipe(plain);
+        return WriteFileAtomic(index_path_, encrypted);
     } catch (const std::exception&) {
         return false;
     }
@@ -171,13 +131,10 @@ bool EncryptedIndex::GetMetadata(const std::string& plaintext_name, FileMetadata
 
 void EncryptedIndex::SetMetadata(const std::string& plaintext_name, const FileMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    // Remove old reverse mapping if exists
     auto old_it = index_.find(plaintext_name);
     if (old_it != index_.end()) {
         reverse_index_.erase(old_it->second.remote_id);
     }
-    
     index_[plaintext_name] = metadata;
     reverse_index_[metadata.remote_id] = plaintext_name;
 }
@@ -226,5 +183,9 @@ std::vector<std::string> EncryptedIndex::GetAllPlaintextNames() {
     return names;
 }
 
-} // namespace encfs
+size_t EncryptedIndex::Size() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return index_.size();
+}
 
+} // namespace encfs

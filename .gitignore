@@ -1,13 +1,13 @@
 build/
+build-*/
+cmake-build-*/
 *.o
 *.a
 *.so
 *.enc
 *.tmp
-~/.encfs_stub_store/
 .DS_Store
 *.swp
 *~
 .vscode/
 .idea/
-

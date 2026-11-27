@@ -1,56 +1,53 @@
-#!/bin/bash
-# cloudcli_stub - Test stub for cloudcli that stores files locally
+#!/usr/bin/env bash
+# cloudcli_stub — stand-in for cloudcli that "uploads" to a local directory.
+#
+#   cloudcli_stub upload   <local_path>             # remote ID = basename minus .enc
+#   cloudcli_stub download <remote_id> <local_path>
+#   cloudcli_stub delete   <remote_id>
+#
+# Storage: $ENCFS_STUB_STORE (default ~/.encfs_stub_store).
+# Set ENCFS_STUB_FAIL=1 to make every command fail (for testing retries).
 
-STORE_DIR="$HOME/.encfs_stub_store"
+set -euo pipefail
+
+STORE_DIR="${ENCFS_STUB_STORE:-$HOME/.encfs_stub_store}"
 mkdir -p "$STORE_DIR"
 
-case "$1" in
+die() { echo "cloudcli_stub: $*" >&2; exit 1; }
+
+[ "${ENCFS_STUB_FAIL:-0}" = "1" ] && die "simulated failure"
+
+check_id() {
+    case "$1" in
+        ""|*/*|.|..) die "invalid remote id: '$1'" ;;
+    esac
+}
+
+case "${1:-}" in
     upload)
-        if [ $# -ne 2 ]; then
-            echo "Usage: cloudcli_stub upload <local_path>" >&2
-            exit 1
-        fi
-        local_path="$2"
-        if [ ! -f "$local_path" ]; then
-            echo "Error: file not found: $local_path" >&2
-            exit 1
-        fi
-        # Extract remote ID from filename (assuming it's <remote_id>.enc)
-        remote_id=$(basename "$local_path" .enc)
-        cp "$local_path" "$STORE_DIR/$remote_id"
-        echo "Uploaded $local_path -> $remote_id"
-        exit 0
+        [ $# -eq 2 ] || die "usage: upload <local_path>"
+        [ -f "$2" ] || die "file not found: $2"
+        remote_id=$(basename "$2" .enc)
+        check_id "$remote_id"
+        # Copy then rename so a concurrent download never sees a partial file.
+        cp "$2" "$STORE_DIR/.$remote_id.partial"
+        mv -f "$STORE_DIR/.$remote_id.partial" "$STORE_DIR/$remote_id"
+        echo "Uploaded $2 -> $remote_id"
         ;;
     download)
-        if [ $# -ne 3 ]; then
-            echo "Usage: cloudcli_stub download <remote_id> <local_path>" >&2
-            exit 1
-        fi
-        remote_id="$2"
-        local_path="$3"
-        if [ ! -f "$STORE_DIR/$remote_id" ]; then
-            echo "Error: remote file not found: $remote_id" >&2
-            exit 1
-        fi
-        cp "$STORE_DIR/$remote_id" "$local_path"
-        echo "Downloaded $remote_id -> $local_path"
-        exit 0
+        [ $# -eq 3 ] || die "usage: download <remote_id> <local_path>"
+        check_id "$2"
+        [ -f "$STORE_DIR/$2" ] || die "remote file not found: $2"
+        cp "$STORE_DIR/$2" "$3"
+        echo "Downloaded $2 -> $3"
         ;;
     delete)
-        if [ $# -ne 2 ]; then
-            echo "Usage: cloudcli_stub delete <remote_id>" >&2
-            exit 1
-        fi
-        remote_id="$2"
-        if [ -f "$STORE_DIR/$remote_id" ]; then
-            rm "$STORE_DIR/$remote_id"
-            echo "Deleted $remote_id"
-        fi
-        exit 0
+        [ $# -eq 2 ] || die "usage: delete <remote_id>"
+        check_id "$2"
+        rm -f "$STORE_DIR/$2"
+        echo "Deleted $2"
         ;;
     *)
-        echo "Usage: cloudcli_stub {upload|download|delete} [args...]" >&2
-        exit 1
+        die "usage: {upload|download|delete} [args...]"
         ;;
 esac
-
