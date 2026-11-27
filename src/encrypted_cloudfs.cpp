@@ -35,6 +35,11 @@ using namespace encfs;
 
 namespace {
 
+// Cloud object names for the index and the passphrase KDF parameters. Blob IDs
+// are 64 hex characters, so these can't collide with them.
+const char kCloudIndexId[] = "index";
+const char kCloudKdfId[] = "encfs.kdf";
+
 // Largest file we'll hold in memory. Files are buffered whole while open, so
 // this bounds memory use from a single runaway writer.
 constexpr uint64_t kMaxFileSize = 4ULL * 1024 * 1024 * 1024;
@@ -71,12 +76,22 @@ struct Context {
     gid_t gid = 0;
     int64_t mount_time = 0;
 
+    // Set when we started with a brand-new index because none could be found
+    // locally or downloaded. Before the first upload we check the cloud again,
+    // so a transient download failure can't make us replace a real index.
+    bool index_guard_pending = false;
+    // Set if that check found an existing cloud index: we refuse all writes
+    // until the user remounts (and the index is restored).
+    bool read_only = false;
+
     // One lock around all filesystem state. FUSE runs us single-threaded
     // (-s), so this costs nothing today but keeps us correct if that changes.
     std::mutex mutex;
 };
 
 Context* g_ctx = nullptr;
+
+int SaveIndex();
 
 void Log(const std::string& msg) {
     std::cerr << "[encfs] " << msg << "\n";
@@ -121,7 +136,7 @@ int DecryptBlob(const std::string& name, FileMetadata meta,
             meta.version = actual;
             meta.size = out.size();
             g_ctx->index->SetMetadata(name, meta);
-            g_ctx->index->Save();
+            SaveIndex();
         }
         return 0;
     case FileCodec::Result::kRollback:
@@ -202,6 +217,7 @@ int EnsureLoaded(OpenFile& file) {
 // Encrypt and write back a dirty file, update the index, queue the upload.
 int Persist(OpenFile& file) {
     if (!file.dirty || file.deleted) return 0;
+    if (g_ctx->read_only) return -EROFS;
 
     FileMetadata meta;
     if (!g_ctx->index->GetMetadata(file.name, meta)) return 0;  // removed meanwhile
@@ -220,11 +236,10 @@ int Persist(OpenFile& file) {
     meta.size = file.data.size();
     meta.mtime = file.mtime;
     g_ctx->index->SetMetadata(file.name, meta);
-    if (!g_ctx->index->Save()) {
+    if (int rc = SaveIndex()) {
         // The blob is now one version ahead of the saved index; DecryptBlob
         // accepts and repairs that on the next read.
-        Log("'" + file.name + "': failed to save index");
-        return -EIO;
+        return rc;
     }
 
     file.dirty = false;
@@ -235,7 +250,7 @@ int Persist(OpenFile& file) {
 // Remove a file's index entry, local blob and (in the background) cloud copy.
 void RemoveFile(const std::string& name, const FileMetadata& meta) {
     g_ctx->index->Remove(name);
-    g_ctx->index->Save();
+    SaveIndex();
     ::unlink(BlobPath(meta.remote_id).c_str());
     g_ctx->cloud->QueueDelete(meta.remote_id);
 
@@ -254,6 +269,32 @@ Handle* FindHandle(struct fuse_file_info* fi) {
 
 int64_t Now() {
     return static_cast<int64_t>(std::time(nullptr));
+}
+
+// Save the index locally and queue its upload, so the cloud copy is enough to
+// restore the filesystem (with the key) on another machine.
+int SaveIndex() {
+    if (!g_ctx->index->Save()) {
+        Log("failed to save index");
+        return -EIO;
+    }
+    if (g_ctx->index_guard_pending) {
+        g_ctx->index_guard_pending = false;
+        const std::string probe = g_ctx->index->path() + ".probe";
+        bool cloud_has_index = g_ctx->cloud->Download(kCloudIndexId, probe);
+        ::unlink(probe.c_str());
+        if (cloud_has_index) {
+            // Our fresh index would overwrite the real one. Throw it away so
+            // the next mount restores the cloud copy, and stop accepting writes.
+            ::unlink(g_ctx->index->path().c_str());
+            g_ctx->read_only = true;
+            Log("the cloud already has an index that could not be downloaded at mount time. "
+                "Writes are disabled; unmount and mount again to restore it.");
+            return -EROFS;
+        }
+    }
+    g_ctx->cloud->QueueUpload(g_ctx->index->path());
+    return 0;
 }
 
 // ── FUSE operations ─────────────────────────────────────────────────────────
@@ -352,6 +393,7 @@ int encfs_open(const char* path, struct fuse_file_info* fi) {
         if (!g_ctx->index->GetMetadata(name, meta)) return -ENOENT;
 
         const bool writable = (fi->flags & O_ACCMODE) != O_RDONLY;
+        if (writable && g_ctx->read_only) return -EROFS;
         auto file = Acquire(name, meta);
 
         if (writable && (fi->flags & O_TRUNC)) {
@@ -373,6 +415,7 @@ int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)mode;
     return Guarded("create", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
         std::string name;
         if (int rc = NameFromPath(path, name)) return rc;
 
@@ -384,9 +427,9 @@ int encfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
             meta.remote_id = g_ctx->codec->RemoteIdFor(name);
             meta.mtime = Now();
             g_ctx->index->SetMetadata(name, meta);
-            if (!g_ctx->index->Save()) {
+            if (int rc = SaveIndex()) {
                 g_ctx->index->Remove(name);
-                return -EIO;
+                return rc;
             }
         }
 
@@ -447,6 +490,7 @@ int encfs_write(const char* path, const char* buf, size_t size, off_t offset,
 int encfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
     return Guarded("truncate", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
         if (size < 0) return -EINVAL;
         if (static_cast<uint64_t>(size) > kMaxFileSize) return -EFBIG;
 
@@ -520,6 +564,7 @@ int encfs_release(const char* path, struct fuse_file_info* fi) {
 int encfs_unlink(const char* path) {
     return Guarded("unlink", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
         std::string name;
         if (int rc = NameFromPath(path, name)) return rc;
         FileMetadata meta;
@@ -534,6 +579,7 @@ int encfs_unlink(const char* path) {
 int encfs_rename(const char* from, const char* to, unsigned int flags) {
     return Guarded("rename", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
         if (flags & RENAME_EXCHANGE) return -EINVAL;
 
         std::string src, dst;
@@ -571,7 +617,7 @@ int encfs_rename(const char* from, const char* to, unsigned int flags) {
             // Undo the in-memory move so the source is still intact.
             g_ctx->index->Remove(dst);
             g_ctx->index->SetMetadata(src, src_meta);
-            g_ctx->index->Save();
+            SaveIndex();
             g_ctx->open_files.erase(dst);
             file->name = src;
             file->remote_id = old_id;
@@ -589,6 +635,7 @@ int encfs_utimens(const char* path, const struct timespec tv[2], struct fuse_fil
     (void)fi;
     return Guarded("utimens", [&]() -> int {
         std::lock_guard<std::mutex> lock(g_ctx->mutex);
+        if (g_ctx->read_only) return -EROFS;
         std::string name;
         if (int rc = NameFromPath(path, name)) return rc;
         FileMetadata meta;
@@ -606,7 +653,7 @@ int encfs_utimens(const char* path, const struct timespec tv[2], struct fuse_fil
         g_ctx->index->SetMetadata(name, meta);
         auto it = g_ctx->open_files.find(name);
         if (it != g_ctx->open_files.end()) it->second->mtime = meta.mtime;
-        return g_ctx->index->Save() ? 0 : -EIO;
+        return SaveIndex();
     });
 }
 
@@ -662,6 +709,21 @@ struct fuse_operations MakeOperations() {
 }
 
 // ── Command line ────────────────────────────────────────────────────────────
+
+bool LocalFileExists(const std::string& path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0;
+}
+
+// Download a cloud object to `path` atomically (temp file + rename).
+bool FetchFromCloud(CloudCLIWrapper& cloud, const std::string& remote_id, const std::string& path) {
+    const std::string tmp = path + ".download";
+    if (cloud.Download(remote_id, tmp) && ::rename(tmp.c_str(), path.c_str()) == 0) {
+        return true;
+    }
+    ::unlink(tmp.c_str());
+    return false;
+}
 
 void PrintUsage(const char* prog) {
     std::cout <<
@@ -744,6 +806,26 @@ int main(int argc, char* argv[]) {
     }
     ::chmod(backing_dir.c_str(), 0700);
 
+    // A new machine (or a lost backing directory): fetch the index, and the
+    // passphrase KDF parameters if needed, from the cloud before checking the key.
+    CloudCLIWrapper bootstrap(cloudcli_cmd);
+    const std::string index_path = backing_dir + "/index.enc";
+    const std::string kdf_path = backing_dir + "/encfs.kdf";
+    bool fresh_index = false;
+    if (!LocalFileExists(index_path)) {
+        if (FetchFromCloud(bootstrap, kCloudIndexId, index_path)) {
+            std::cerr << "[encfs] restored the index from the cloud\n";
+        } else {
+            fresh_index = true;
+            std::cerr << "[encfs] no index found locally or in the cloud: starting a new "
+                         "filesystem\n";
+        }
+    }
+    bool had_kdf = LocalFileExists(kdf_path);
+    if (key_options.use_passphrase && !had_kdf) {
+        had_kdf = FetchFromCloud(bootstrap, kCloudKdfId, kdf_path);
+    }
+
     std::vector<uint8_t> master_key;
     std::string error;
     if (!ResolveMasterKey(key_options, backing_dir, /*allow_create=*/true, master_key, error)) {
@@ -767,9 +849,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    ctx->index_guard_pending = fresh_index;
     ctx->cloud->SetJournalPath(backing_dir + "/sync.journal");
     if (size_t resumed = ctx->cloud->RecoverJournal()) {
         std::cerr << "[encfs] resuming " << resumed << " unfinished cloud operation(s)\n";
+    }
+    if (!had_kdf && LocalFileExists(kdf_path)) {
+        ctx->cloud->QueueUpload(kdf_path);  // KDF parameters were just created
     }
     g_ctx = ctx.get();
 

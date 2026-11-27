@@ -16,6 +16,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Background sync** — uploads and deletes run in a worker thread with retries and exponential back-off; redundant operations are coalesced
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
+- **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — hex or raw key file, or a passphrase (PBKDF2-HMAC-SHA256, 600k iterations)
 - **Works with everyday tools** — append, partial overwrite, truncate, `mv`, `touch`, `cp -p`, `rsync`, `df`
 
@@ -78,7 +79,13 @@ Blobs written by v1 are still readable and are rewritten as v2 the next time the
 
 ### Index format
 
-`index.enc` holds, per file: plaintext name, remote ID, version counter, size and mtime. It is serialized little-endian, then encrypted with AES-256-GCM under the index key. The index is **local only** and is not uploaded, so back it up together with your key (see *Limitations*).
+`index.enc` holds, per file: plaintext name, remote ID, version counter, size and mtime. It is serialized little-endian, then encrypted with AES-256-GCM under the index key. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
+
+### Restoring on a new machine
+
+When you mount and the backing directory has no `index.enc`, it is downloaded from the cloud first, so pointing a fresh, empty backing directory at the same cloud with the same key restores everything. Blobs are then fetched as files are opened. `decrypt_by_name` does the same.
+
+If no index can be downloaded, the mount starts a new, empty filesystem. If that was only because the cloud was briefly unreachable, the first write checks the cloud again before uploading anything. If an index turns up there, the write fails with `EROFS`, writes stay disabled, and the local fresh index is discarded, so the real index is never overwritten. Remount to restore it.
 
 ### Rollback detection
 
@@ -191,7 +198,7 @@ CI runs everything, including the FUSE tests, in Release and in ASan/UBSan build
 
 - **Flat namespace**: there are no subdirectories.
 - **Whole-file buffering**: an open file is held in memory (capped at 4 GiB per file), and each save re-encrypts the whole file.
-- **Index is local**: `index.enc` isn't uploaded. If you lose it you can still recover a file whose name you know, by computing its remote ID, but you can't list what's in the cloud.
+- **Single writer**: don't mount the same cloud store from two machines at once. Each machine's index would overwrite the other's.
 - **Permissions aren't stored**: everything belongs to the mounting user. `chmod`/`chown` are accepted but ignored.
 - **Rename isn't atomic across a crash**: it re-encrypts the file under the new name's ID before removing the old one, so a crash mid-rename can leave both copies.
 
@@ -203,7 +210,6 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ## Roadmap
 
-- Upload the encrypted index so the cloud copy is self-describing (today it is local only)
 - Subdirectory support (the namespace is currently flat)
 - Chunk-level reads and writes, so large files aren't buffered whole
 - Optional filename padding to hide size/length patterns
@@ -211,6 +217,13 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v2.1 — restore from the cloud
+
+- The encrypted index (and, in passphrase mode, the KDF parameters) is uploaded after every change.
+- Mounting, or running `decrypt_by_name`, with an empty backing directory restores from the cloud.
+- A guard stops a new filesystem from overwriting an existing cloud index when the download at mount time failed.
+- New end-to-end tests: full restore from the cloud, the overwrite guard, and recovery with `decrypt_by_name`.
 
 ### v2.0 — review and hardening
 

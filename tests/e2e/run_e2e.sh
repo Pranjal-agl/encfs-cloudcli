@@ -27,8 +27,9 @@ fail() { echo "  ✗ $1"; FAILURES=$((FAILURES + 1)); }
 check() { local desc=$1; shift; if "$@"; then pass "$desc"; else fail "$desc"; fi; }
 check_fails() { local desc=$1; shift; if "$@"; then fail "$desc"; else pass "$desc"; fi; }
 
+CLOUDCLI="$STUB"
 mount_fs() {
-    "$FS_BIN" -k "$KEY" -c "$STUB" "$MNT" "$BACK" >>"$LOG" 2>&1 &
+    "$FS_BIN" -k "$KEY" -c "$CLOUDCLI" "$MNT" "$BACK" >>"$LOG" 2>&1 &
     FS_PID=$!
     for _ in $(seq 50); do
         mountpoint -q "$MNT" && return 0
@@ -55,7 +56,7 @@ cleanup() {
 trap cleanup EXIT
 
 blob_ids() { find "$BACK" -maxdepth 1 -name '*.enc' ! -name index.enc -printf '%f\n' | sed 's/\.enc$//' | sort; }
-cloud_ids() { find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name '.*' -printf '%f\n' | sort; }
+cloud_ids() { find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name '.*' ! -name index ! -name encfs.kdf -printf '%f\n' | sort; }
 
 echo "Running FUSE end-to-end tests in $WORK"
 if ! mount_fs; then
@@ -131,6 +132,7 @@ unmount_fs
 check "cloud matches backing dir after unmount" [ "$(blob_ids)" = "$(cloud_ids)" ]
 check "cloud holds one blob per file"           [ "$(cloud_ids | wc -l)" = 6 ]
 check "no sync journal left behind"             [ ! -e "$BACK/sync.journal" ]
+check "encrypted index uploaded to the cloud"   cmp -s "$BACK/index.enc" "$ENCFS_STUB_STORE/index"
 
 # ── Remount: data persists; evicted blobs are fetched from the cloud ──
 find "$BACK" -name '*.enc' ! -name index.enc -delete
@@ -175,6 +177,43 @@ INDEX_SUM=$(md5sum < "$BACK/index.enc")
 (umask 077 && openssl rand -hex 32 > "$WORK/wrong_key")
 check_fails "wrong key refuses to mount" "$FS_BIN" -k "$WORK/wrong_key" -c "$STUB" "$MNT" "$BACK" 2>/dev/null
 check "wrong key leaves index untouched" [ "$(md5sum < "$BACK/index.enc")" = "$INDEX_SUM" ]
+
+# ── Restore everything from the cloud alone (new machine) ──
+EXPECTED_LIST=$("$DECRYPT_BIN" -k "$KEY" --list "$BACK" | sort)
+rm -rf "$BACK"
+mount_fs || fail "mount with empty backing dir"
+check "index restored from cloud"     [ "$(find "$MNT" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = "big.bin c.txt empty hello.txt rw-copy.bin rw.bin " ]
+check "contents restored from cloud"  [ "$(cat "$MNT/c.txt")" = "moving" ]
+unmount_fs
+check "decrypt_by_name restores into a new dir" \
+    [ "$("$DECRYPT_BIN" -k "$KEY" -c "$STUB" "$WORK/elsewhere" c.txt - 2>/dev/null)" = "moving" ]
+check "decrypt_by_name --list from cloud" \
+    [ "$("$DECRYPT_BIN" -k "$KEY" -c "$STUB" --list "$WORK/elsewhere2" 2>/dev/null | sort)" = "$EXPECTED_LIST" ]
+
+# ── A cloud index we failed to download must not be overwritten ──
+# Simulate the cloud being unreachable for the index download at mount time
+# only, then reachable again.
+FLAKY="$WORK/flaky_cloudcli"
+cat > "$FLAKY" <<FLAKY_EOF
+#!/usr/bin/env bash
+if [ -e "$WORK/cloud_down" ] && [ "\$1" = download ]; then exit 1; fi
+exec "$STUB" "\$@"
+FLAKY_EOF
+chmod +x "$FLAKY"
+CLOUD_INDEX_SUM=$(md5sum < "$ENCFS_STUB_STORE/index")
+rm -rf "$BACK"
+touch "$WORK/cloud_down"
+CLOUDCLI="$FLAKY"
+mount_fs || fail "mount while cloud is down"
+rm "$WORK/cloud_down"
+check_fails "write refused when a cloud index exists" bash -c "echo x > '$MNT/new.txt' 2>/dev/null"
+unmount_fs
+check "cloud index left untouched"   [ "$(md5sum < "$ENCFS_STUB_STORE/index")" = "$CLOUD_INDEX_SUM" ]
+check "no stale local index kept"    [ ! -e "$BACK/index.enc" ]
+mount_fs || fail "remount after cloud recovers"
+check "remount restores the real index" [ "$(cat "$MNT/c.txt")" = "moving" ]
+unmount_fs
+CLOUDCLI="$STUB"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
