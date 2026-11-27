@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(encfs-cloudcli VERSION 2.3.0 LANGUAGES CXX)
+project(encfs-cloudcli VERSION 2.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,3 +77,10 @@ if(ENCFS_E2E)
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/cloudcli_stub)
     set_tests_properties(test_e2e_fuse PROPERTIES TIMEOUT 120)
 endif()
+
+# Cross-check web/encfs.js (the browser implementation) against the C++ code.
+add_executable(web_fixtures tests/web/web_fixtures.cpp)
+target_link_libraries(web_fixtures PRIVATE encfs_core)
+add_test(NAME test_web_crosscheck
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/web/run_cross_check.sh $<TARGET_FILE:web_fixtures>)
+set_tests_properties(test_web_crosscheck PROPERTIES SKIP_RETURN_CODE 77)

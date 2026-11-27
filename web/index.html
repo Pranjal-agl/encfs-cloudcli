@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Nothing on this page may contact a server: keys and files stay in the browser. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<title>encfs-cloudcli: encrypted files, byte by byte</title>
+<meta name="description" content="See what an encfs-cloudcli encrypted file looks like, tamper with it, and recover your files in the browser.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%231e2b2f%27/%3E%3Crect x=%274%27 y=%277%27 width=%278%27 height=%276%27 rx=%271%27 fill=%27%23f1f3f2%27/%3E%3Cpath d=%27M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7%27 stroke=%27%23f1f3f2%27 stroke-width=%271.4%27 fill=%27none%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="./">encfs-cloudcli</a>
+  <nav>
+    <a href="#blob">Live blob</a>
+    <a href="#recover">Recover files</a>
+    <a href="https://github.com/Pranjal-agl/encfs-cloudcli">Source on GitHub</a>
+  </nav>
+</header>
+
+<main>
+  <section class="intro">
+    <h1>See exactly what your files look like in the cloud.</h1>
+    <p class="lede">
+      encfs-cloudcli is a FUSE filesystem. You save files normally, and only encrypted,
+      tamper-evident blobs like the one below ever reach the cloud. This page runs the same
+      format in your browser: change the text, then try to forge it.
+    </p>
+  </section>
+
+  <section id="blob" class="blob" aria-labelledby="blob-title">
+    <h2 id="blob-title" class="visually-hidden">Live encrypted blob</h2>
+    <div class="blob-inputs">
+      <label class="field grow">
+        <span>Contents of <code id="demo-name">notes.txt</code></span>
+        <textarea id="plaintext" rows="2" maxlength="240" spellcheck="false">Meet at the old library, 7pm. Bring the second key.</textarea>
+      </label>
+      <label class="field">
+        <span>Chunk size: <output id="chunk-size-out">16</output> bytes</span>
+        <input id="chunk-size" type="range" min="8" max="64" step="8" value="16">
+      </label>
+    </div>
+
+    <p id="verdict" class="verdict" role="status" aria-live="polite">Encrypting…</p>
+
+    <div class="bytes-wrap">
+      <div id="bytes" class="bytes" aria-label="Encrypted blob bytes. Activate a byte to flip one of its bits."></div>
+      <p id="byte-info" class="byte-info">Point at a byte to see what it is. Click it to flip a bit.</p>
+    </div>
+
+    <div class="legend" aria-hidden="true">
+      <span class="r-magic">file signature</span>
+      <span class="r-ver">format version</span>
+      <span class="r-cs">chunk size</span>
+      <span class="r-salt">random salt (per-file key)</span>
+      <span class="r-len">chunk length</span>
+      <span class="r-ct">ciphertext</span>
+      <span class="r-tag">authentication tag</span>
+    </div>
+
+    <div class="attacks">
+      <p class="attacks-title">Try to get a forgery past it</p>
+      <div class="buttons">
+        <button type="button" data-attack="flip">Flip a random bit</button>
+        <button type="button" data-attack="truncate">Cut off the last chunk</button>
+        <button type="button" data-attack="swap">Swap the first two chunks</button>
+        <button type="button" data-attack="rename">Pass it off as another file</button>
+        <button type="button" data-attack="rollback">Serve an older version</button>
+        <button type="button" data-attack="reset" class="quiet">Undo all changes</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="how" aria-labelledby="how-title">
+    <h2 id="how-title">Why every forgery fails</h2>
+    <dl>
+      <div><dt>Each file gets its own key</dt>
+        <dd>The 32-byte random salt in the header derives a fresh AES-256 key for this blob alone,
+          so nonces can never repeat across files.</dd></div>
+      <div><dt>Chunks know where they belong</dt>
+        <dd>A chunk's nonce encodes its position and whether it is the last one. Reordered,
+          dropped or appended chunks fail authentication.</dd></div>
+      <div><dt>Blobs know which file they are</dt>
+        <dd>Every tag also covers the header, the file's ID and its version number. A blob can't
+          be swapped for another file's, and an old copy can't be replayed.</dd></div>
+      <div><dt>Names stay private</dt>
+        <dd>In the cloud this blob is stored as <code id="demo-id" class="wrap"></code>, an HMAC
+          of its path. The real names live only in the encrypted index.</dd></div>
+    </dl>
+  </section>
+
+  <section id="recover" class="recover" aria-labelledby="recover-title">
+    <h2 id="recover-title">Recover files without installing anything</h2>
+    <p>
+      Lost the machine, or just need one file? Point this page at a backing folder, or a copy of
+      it from the cloud, and decrypt files here. Nothing is uploaded: the page can't open
+      network connections.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <h3>Choose your backing folder</h3>
+        <p>The folder containing <code>index.enc</code> and the <code>.enc</code> blobs.</p>
+        <label class="file-button">
+          <input id="backing-folder" type="file" webkitdirectory multiple>
+          <span>Choose folder</span>
+        </label>
+        <label class="file-button secondary">
+          <input id="backing-files" type="file" multiple>
+          <span>or pick individual files</span>
+        </label>
+        <p id="backing-summary" class="hint"></p>
+      </li>
+      <li>
+        <h3>Unlock it</h3>
+        <div class="key-modes" role="radiogroup" aria-label="How to unlock">
+          <label><input type="radio" name="key-mode" value="file" checked> Key file</label>
+          <label><input type="radio" name="key-mode" value="hex"> Paste key</label>
+          <label><input type="radio" name="key-mode" value="passphrase"> Passphrase</label>
+        </div>
+        <div class="key-input" data-mode="file">
+          <label class="file-button">
+            <input id="key-file" type="file">
+            <span>Choose key file</span>
+          </label>
+          <span id="key-file-name" class="hint"></span>
+        </div>
+        <div class="key-input" data-mode="hex" hidden>
+          <label class="field">
+            <span>64 hex characters, as in <code>~/.encfs/key</code></span>
+            <input id="key-hex" type="password" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+        <div class="key-input" data-mode="passphrase" hidden>
+          <label class="field">
+            <span>Passphrase (the folder must include <code>encfs.kdf</code>)</span>
+            <input id="passphrase" type="password" autocomplete="off">
+          </label>
+        </div>
+        <button id="unlock" type="button" class="primary">Unlock</button>
+        <p id="unlock-status" class="hint" role="status" aria-live="polite"></p>
+      </li>
+      <li>
+        <h3>Save what you need</h3>
+        <div id="file-list-actions" class="list-actions" hidden>
+          <button id="verify-all" type="button">Check every file</button>
+          <button id="lock" type="button" class="quiet">Lock and forget the key</button>
+        </div>
+        <div id="file-list" class="file-list">
+          <p class="hint">Your files will appear here after unlocking.</p>
+        </div>
+      </li>
+    </ol>
+  </section>
+</main>
+
+<footer class="site">
+  <p>
+    The format code on this page (<a href="encfs.js">encfs.js</a>) is checked against the C++
+    implementation on every commit.
+    MIT licensed. <a href="https://github.com/Pranjal-agl/encfs-cloudcli">Pranjal-agl/encfs-cloudcli</a>
+  </p>
+</footer>
+</body>
+</html>
