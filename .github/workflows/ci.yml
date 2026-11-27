@@ -89,9 +89,14 @@ jobs:
         name: fuzz-crashes
         path: build/crash-*
 
-
+  shellcheck:
+    name: Lint (shellcheck, actionlint)
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
     - name: Lint shell scripts
       run: shellcheck tools/cloudcli_stub tests/e2e/run_e2e.sh tests/web/run_cross_check.sh run_and_prove.sh
+    - name: Lint workflows
+      run: |
+        pip install actionlint-py
+        actionlint
