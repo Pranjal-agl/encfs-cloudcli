@@ -124,7 +124,7 @@ check "readdir lists files" \
 
 # ── Nothing leaks in plaintext ──
 check "no plaintext names/data in backing dir" \
-    bash -c "! grep -rqa -e moving -e 'c.txt' -e big.bin '$BACK'"
+    bash -c "! grep -rqasF -e moving -e 'c.txt' -e big.bin '$BACK'"
 
 # ── Unmount: pending uploads/deletes must be flushed ──
 unmount_fs
@@ -235,7 +235,7 @@ check "mv directory moves contents"    [ "$(cat "$MNT/proj/lib/deep/x.txt")" = "
 check "...old path gone"               [ ! -e "$MNT/proj/src" ]
 mv "$MNT/proj/README" "$MNT/proj/lib/deep/README"
 check "mv file between directories"    [ "$(cat "$MNT/proj/lib/deep/README")" = "readme" ]
-check "names stay private"             bash -c "! grep -rqa -e proj -e main.c -e deep '$BACK'"
+check "names stay private"             bash -c "! grep -rqasF -e proj/src -e main.c -e deep/x.txt '$BACK'"
 
 unmount_fs
 mount_fs || fail "remount for directory tests"
@@ -246,6 +246,27 @@ rm -r "$MNT/proj"
 check "rm -r removes the tree"         [ ! -e "$MNT/proj" ]
 unmount_fs
 check "no orphaned blobs in the cloud" [ "$(cloud_ids | wc -l)" = 6 ]
+
+# ── Offline verify and export ──
+check "decrypt_by_name --verify passes" \
+    "$DECRYPT_BIN" -k "$KEY" -c "$STUB" --verify "$BACK" 2>/dev/null
+"$DECRYPT_BIN" -k "$KEY" -c "$STUB" --extract-all "$WORK/export" "$BACK" 2>/dev/null
+check "--extract-all writes every file"      [ "$(find "$WORK/export" -type f | wc -l)" = 6 ]
+check "--extract-all contents match"         cmp -s "$WORK/big" "$WORK/export/big.bin"
+check "--extract-all restores mtimes"        [ "$(stat -c %Y "$WORK/export/empty")" = 981173106 ]
+check_fails "--extract-all refuses a non-empty dir" \
+    "$DECRYPT_BIN" -k "$KEY" -c "$STUB" --extract-all "$WORK/export" "$BACK" 2>/dev/null
+
+SOME_BLOB=$(find "$BACK" -name '*.enc' ! -name index.enc | head -1)
+cp "$SOME_BLOB" "$WORK/blob_backup"
+printf '\xff' | dd of="$SOME_BLOB" bs=1 seek=70 conv=notrunc status=none
+check "--verify reports a tampered blob" \
+    bash -c "'$DECRYPT_BIN' -k '$KEY' -c '$STUB' --verify '$BACK' 2>/dev/null | grep -q CORRUPT"
+cp "$WORK/blob_backup" "$SOME_BLOB"
+cp "$SOME_BLOB" "$BACK/$(printf 'f%.0s' $(seq 64)).enc"
+check "--verify reports leftover blobs" \
+    bash -c "'$DECRYPT_BIN' -k '$KEY' -c '$STUB' --verify '$BACK' 2>/dev/null | grep -q LEFTOVER"
+rm "$BACK/$(printf 'f%.0s' $(seq 64)).enc"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

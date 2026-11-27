@@ -172,12 +172,16 @@ encrypted_cloudfs [options] <mountpoint> <backing_dir> [-- <fuse options>]
 
 If the backing directory already has an index, the key must be able to decrypt it. Otherwise the filesystem refuses to mount, so a wrong key can't overwrite your index.
 
-### Recovering files without mounting
+### Recovering and checking files without mounting
 
 ```bash
-./build/decrypt_by_name --list ~/enc_backing              # size and name of every file
-./build/decrypt_by_name ~/enc_backing notes.txt out.txt   # or "-" for stdout
+./build/decrypt_by_name --list ~/enc_backing                  # every path, with sizes
+./build/decrypt_by_name ~/enc_backing docs/notes.txt out.txt  # one file ("-" for stdout)
+./build/decrypt_by_name --verify ~/enc_backing                # authenticate every file
+./build/decrypt_by_name --extract-all ~/export ~/enc_backing  # decrypt the whole tree
 ```
+
+`--verify` decrypts every file and reports anything that is missing, corrupt or rolled back, plus unreferenced blobs. It exits with status 1 if there's a problem, so it fits in a cron job. `--extract-all` recreates the directory tree with modification times. It's also the way to migrate a store, for example away from a legacy 128-bit key.
 
 ### Testing locally with cloudcli_stub
 
@@ -225,7 +229,7 @@ CI runs everything, including the FUSE tests, in Release and in ASan/UBSan build
 
 ### Upgrading from v1
 
-v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* of a hex key file as the key (128 bits of entropy), whereas v2 decodes the hex properly (256 bits). Backing directories created by v1 are detected and still open, with a warning. To upgrade one, mount it, copy the files out, and copy them into a fresh backing directory.
+v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* of a hex key file as the key (128 bits of entropy), whereas v2 decodes the hex properly (256 bits). Backing directories created by v1 are detected and still open, with a warning. To upgrade one, run `decrypt_by_name --extract-all` on it, then copy the export into a fresh mount.
 
 ---
 
@@ -238,6 +242,11 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ## Changelog
 
+### v2.5 — verify and export
+
+- `decrypt_by_name --verify` authenticates every file and reports missing, corrupt and rolled-back files and leftover blobs, with a non-zero exit status if anything is wrong.
+- `decrypt_by_name --extract-all DIR` decrypts the whole tree, with directories and mtimes. It refuses a non-empty target and paths that would escape it.
+- Fixed two end-to-end checks that could fail at random: their short regex patterns sometimes matched random ciphertext.
 ### v2.4 — in the browser
 
 - `web/`: an interactive blob explainer and a client-side recovery tool, deployed to GitHub Pages.
