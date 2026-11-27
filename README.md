@@ -201,6 +201,15 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ---
 
+## Roadmap
+
+- Upload the encrypted index so the cloud copy is self-describing (today it is local only)
+- Subdirectory support (the namespace is currently flat)
+- Chunk-level reads and writes, so large files aren't buffered whole
+- Optional filename padding to hide size/length patterns
+
+---
+
 ## Changelog
 
 ### v2.0 — review and hardening
