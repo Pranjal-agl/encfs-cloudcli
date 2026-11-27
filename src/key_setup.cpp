@@ -22,6 +22,9 @@ const uint8_t kKdfMagic[8] = {'E', 'N', 'C', 'F', 'S', 'K', 'D', 'F'};
 constexpr size_t kKdfSaltSize = 16;
 constexpr uint32_t kDefaultIterations = 600000;  // OWASP 2023 guidance for PBKDF2-HMAC-SHA256
 constexpr uint32_t kMinIterations = 10000;
+// encfs.kdf can come from the cloud: cap the work factor it can demand so a
+// corrupted or malicious file can't make mounting hang for hours.
+constexpr uint32_t kMaxIterations = 50'000'000;
 
 struct KdfParams {
     uint32_t iterations = kDefaultIterations;
@@ -41,8 +44,9 @@ bool LoadKdfParams(const std::string& path, KdfParams& params, std::string& erro
         return false;
     }
     params.iterations = LoadU32LE(data.data() + sizeof(kKdfMagic));
-    if (params.iterations < kMinIterations) {
-        error = path + " specifies too few PBKDF2 iterations";
+    if (params.iterations < kMinIterations || params.iterations > kMaxIterations) {
+        error = path + " specifies an unreasonable PBKDF2 iteration count (" +
+                std::to_string(params.iterations) + ")";
         return false;
     }
     params.salt.assign(data.begin() + sizeof(kKdfMagic) + 4, data.end());

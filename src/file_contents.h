@@ -88,7 +88,6 @@ private:
 
     int scratch_fd_ = -1;
     std::vector<uint8_t> scratch_key_;
-    uint64_t scratch_counter_ = 0;
 
     uint64_t ChunkCount() const;
     // Fill `out` (chunk_size_ bytes) with chunk `index` without caching it.

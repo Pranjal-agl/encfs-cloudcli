@@ -33,6 +33,9 @@ jobs:
 
     - name: Install dependencies
       run: |
+        # The runner image's Microsoft repo sometimes returns 403 and fails
+        # `apt-get update`; we don't need it.
+        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
         sudo apt-get update
         sudo apt-get install -y build-essential cmake libfuse3-dev libssl-dev pkg-config fuse3
 
@@ -62,9 +65,44 @@ jobs:
         TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
       run: ctest --test-dir build --output-on-failure
 
+  fuzz:
+    name: Fuzz (libFuzzer, 60 s per target)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        # The runner image's Microsoft repo sometimes returns 403 and fails
+        # `apt-get update`; we don't need it.
+        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+        sudo apt-get update
+        sudo apt-get install -y clang libclang-rt-18-dev cmake libfuse3-dev libssl-dev pkg-config
+
+    - name: Build fuzz targets
+      run: |
+        CXX=clang++ cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DENCFS_FUZZ=ON -DENCFS_FUZZ_SECONDS=60
+        cmake --build build -j"$(nproc)" --target fuzz_blob fuzz_index fuzz_contents fuzz_journal
+
+    - name: Fuzz
+      run: ctest --test-dir build -R '^fuzz_' --output-on-failure -j4
+
+    - name: Upload crashing inputs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-crashes
+        path: build/crash-*
+
   shellcheck:
+    name: Lint (shellcheck, actionlint)
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
     - name: Lint shell scripts
       run: shellcheck tools/cloudcli_stub tests/e2e/run_e2e.sh tests/web/run_cross_check.sh run_and_prove.sh
+    - name: Lint workflows
+      run: |
+        pip install actionlint-py
+        actionlint
