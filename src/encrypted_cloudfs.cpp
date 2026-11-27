@@ -1385,9 +1385,8 @@ int main(int argc, char* argv[]) {
                          "filesystem\n";
         }
     }
-    bool had_kdf = LocalFileExists(kdf_path);
-    if (key_options.use_passphrase && !had_kdf) {
-        had_kdf = FetchFromCloud(bootstrap, kCloudKdfId, kdf_path);
+    if (key_options.use_passphrase && !LocalFileExists(kdf_path)) {
+        FetchFromCloud(bootstrap, kCloudKdfId, kdf_path);
     }
 
     std::vector<uint8_t> master_key;
@@ -1419,8 +1418,10 @@ int main(int argc, char* argv[]) {
     if (size_t resumed = ctx->cloud->RecoverJournal()) {
         std::cerr << "[encfs] resuming " << resumed << " unfinished cloud operation(s)\n";
     }
-    if (!had_kdf && LocalFileExists(kdf_path)) {
-        ctx->cloud->QueueUpload(kdf_path);  // KDF parameters were just created
+    if (key_options.use_passphrase && LocalFileExists(kdf_path)) {
+        // Keep the cloud copy current (new store, `encfsctl passwd`, or an
+        // earlier upload that failed). It's tiny.
+        ctx->cloud->QueueUpload(kdf_path);
     }
     g_ctx = ctx.get();
     if (cache_limit > 0) {

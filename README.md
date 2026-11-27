@@ -22,7 +22,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Bounded local cache** — with `--cache-size 20G` the backing directory becomes a cache. Blobs the cloud provably holds at their current version are evicted least-recently-used first, and nothing is evicted while an upload is pending.
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
-- **Key flexibility** — hex or raw key file, or a passphrase (PBKDF2-HMAC-SHA256, 600k iterations)
+- **Key flexibility** — a key file, or a passphrase that wraps a random master key (PBKDF2-HMAC-SHA256, 600k iterations). The passphrase can be changed without re-encrypting anything.
 - **Directories** — `mkdir -p`, nested files, directory renames, `rm -r`, with every path name kept private
 - **Works with everyday tools** — append, partial overwrite, truncate, `mv`, `touch`, `cp -rp`, `tar`, `rsync -a`, `find`, `df`
 
@@ -158,7 +158,8 @@ cmake --build build -j"$(nproc)"
 | Binary | Description |
 |---|---|
 | `encrypted_cloudfs` | The FUSE filesystem |
-| `decrypt_by_name` | List or recover files from a backing directory without mounting |
+| `encfsctl` | Set up a store (`init`), change its passphrase (`passwd`), show its state (`status`) |
+| `decrypt_by_name` | List, verify, recover or export files without mounting |
 | `test_crypto`, `test_index`, `test_integration` | Test suites |
 
 CMake options: `-DENCFS_WERROR=ON` (warnings are errors), `-DENCFS_SANITIZE=ON` (ASan + UBSan), `-DENCFS_E2E=ON` (registers the FUSE end-to-end test).
@@ -168,10 +169,12 @@ CMake options: `-DENCFS_WERROR=ON` (warnings are errors), `-DENCFS_SANITIZE=ON` 
 ## Usage
 
 ```bash
-# Generate a key (either format works)
-mkdir -p ~/.encfs && (umask 077 && openssl rand -hex 32 > ~/.encfs/key)
+# Set up a store: creates ~/.encfs/key (mode 0600). Back that file up!
+./build/encfsctl init ~/enc_backing
+#   or, protected by a passphrase instead of a key file:
+#   ./build/encfsctl init --passphrase ~/enc_backing
 
-mkdir -p ~/enc_mount ~/enc_backing
+mkdir -p ~/enc_mount
 ./build/encrypted_cloudfs ~/enc_mount ~/enc_backing        # stays in the foreground
 #   or: ./build/encrypted_cloudfs --background ~/enc_mount ~/enc_backing
 
@@ -194,6 +197,20 @@ encrypted_cloudfs [options] <mountpoint> <backing_dir> [-- <fuse options>]
 ```
 
 If the backing directory already has an index, the key must be able to decrypt it. Otherwise the filesystem refuses to mount, so a wrong key can't overwrite your index.
+
+### Passphrases
+
+`encfsctl init --passphrase` creates `encfs.kdf`, which holds a random 256-bit master key wrapped (AES-256-GCM) with a key derived from your passphrase. It isn't secret, and it's synced to the cloud so you can restore on a new machine.
+
+```bash
+./build/encfsctl passwd ~/enc_backing     # change it; nothing is re-encrypted
+./build/encfsctl status -p ~/enc_backing  # files, cache use, pending uploads
+```
+
+- A wrong passphrase is rejected immediately, even before the store has any files.
+- `passwd` uploads the new `encfs.kdf` straight away, and every mount uploads it again in case that failed.
+- Stores created before v2.10 used the passphrase to derive the master key directly (KDF v1). `passwd` upgrades them in place, around the same key.
+- Changing a passphrase doesn't change the master key. If an old passphrase leaked *and* someone kept an old `encfs.kdf`, they can still unlock the store. To fully re-key, `decrypt_by_name --extract-all` and copy the files into a new store.
 
 ### Limiting local disk use
 
@@ -281,6 +298,13 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v2.10 — key management
+
+- **`encfs.kdf` v2**: passphrase stores now wrap a random master key, so `encfsctl passwd` changes the passphrase without re-encrypting anything, and a wrong passphrase is rejected even on an empty store. Before, a typo on first use locked the store to the typo. v1 files still work and are upgraded in place by `passwd`.
+- **`encfsctl`**: `init` creates a key file with mode 0600 or a passphrase store, `passwd` changes the passphrase and pushes `encfs.kdf` to the cloud, and `status` shows files, cache use, pending sync operations and the KDF version.
+- The browser recovery tool reads v2 KDF files, cross-checked against C++.
+- e2e: fixed checks whose trailing `>/dev/null` had been hiding their own result line, including `df works` since v2.0.
 
 ### v2.9 — concurrency
 

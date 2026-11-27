@@ -87,16 +87,29 @@ export function legacyKey(bytes) {
   return bytes.slice(0, 32);
 }
 
-// <backing>/encfs.kdf: "ENCFSKDF" | iterations:u32le | salt[16]
+// <backing>/encfs.kdf (see src/key_setup.cpp):
+//   v1 "ENCFSKDF" | iterations:u32le | salt[16]               master = PBKDF2(pass)
+//   v2 "ENCFSKD2" | iterations:u32le | salt[16] | wrapped[60]  master = AES-GCM-unwrap(
+//      PBKDF2(pass), wrapped, aad = first 28 bytes)
 export async function keyFromPassphrase(passphrase, kdfBytes) {
-  if (kdfBytes.length !== 28 || dec.decode(kdfBytes.slice(0, 8)) !== "ENCFSKDF") {
-    throw new Error("not a valid encfs.kdf file");
-  }
+  const magic = dec.decode(kdfBytes.slice(0, 8));
+  const v1 = magic === "ENCFSKDF" && kdfBytes.length === 28;
+  const v2 = magic === "ENCFSKD2" && kdfBytes.length === 88;
+  if (!v1 && !v2) throw new Error("not a valid encfs.kdf file");
   const iterations = getU32(kdfBytes, 8);
-  const salt = kdfBytes.slice(12);
+  if (iterations < 10000 || iterations > 50_000_000) throw new Error("unreasonable iteration count in encfs.kdf");
+  const salt = kdfBytes.slice(12, 28);
   const base = await subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveBits"]);
-  return new Uint8Array(await subtle.deriveBits(
+  const derived = new Uint8Array(await subtle.deriveBits(
     { name: "PBKDF2", hash: "SHA-256", salt, iterations }, base, 256));
+  if (v1) return derived;
+  const kek = await aesKey(derived, "decrypt");
+  const wrapped = kdfBytes.slice(28);
+  try {
+    return await gcmDecrypt(kek, wrapped.slice(0, 12), kdfBytes.slice(0, 28), wrapped.slice(12));
+  } catch {
+    throw new AuthError("wrong passphrase");
+  }
 }
 
 // All keys derived from the master key (see README "Keys").

@@ -32,6 +32,11 @@ for (const line of readFileSync(`${dir}/expected.tsv`, "utf8").split("\n").filte
 
 const pkey = await encfs.keyFromPassphrase("correct horse battery staple", read(`${dir}/encfs.kdf`));
 check(encfs.toHex(pkey) === readFileSync(`${dir}/kdf_expected.hex`, "utf8").trim(), "PBKDF2 passphrase key matches");
+const wkey = await encfs.keyFromPassphrase("correct horse battery staple", read(`${dir}/kdf_v2/encfs.kdf`));
+check(encfs.toHex(wkey) === readFileSync(`${dir}/kdf_v2_expected.hex`, "utf8").trim(), "JS unwraps a v2 (wrapped) encfs.kdf");
+let wrongRejected = false;
+try { await encfs.keyFromPassphrase("wrong", read(`${dir}/kdf_v2/encfs.kdf`)); } catch (e) { wrongRejected = e instanceof encfs.AuthError; }
+check(wrongRejected, "JS rejects a wrong passphrase for a v2 encfs.kdf");
 
 // Tampering is detected by the JS decoder too.
 const hello = byName.get("hello.txt");

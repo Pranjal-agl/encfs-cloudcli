@@ -2,13 +2,14 @@
 # End-to-end test: mounts the real filesystem with FUSE and exercises it with
 # ordinary shell tools. Needs /dev/fuse and fusermount3.
 #
-#   tests/e2e/run_e2e.sh <encrypted_cloudfs> <decrypt_by_name> <cloudcli_stub>
+#   tests/e2e/run_e2e.sh <encrypted_cloudfs> <decrypt_by_name> <encfsctl> <cloudcli_stub>
 
 set -uo pipefail
 
 FS_BIN=$(realpath "$1")
 DECRYPT_BIN=$(realpath "$2")
-STUB=$(realpath "$3")
+CTL_BIN=$(realpath "$3")
+STUB=$(realpath "$4")
 
 WORK=$(mktemp -d /tmp/encfs_e2e.XXXXXX)
 MNT="$WORK/mnt"
@@ -26,6 +27,9 @@ pass() { echo "  ✓ $1"; }
 fail() { echo "  ✗ $1"; FAILURES=$((FAILURES + 1)); }
 check() { local desc=$1; shift; if "$@"; then pass "$desc"; else fail "$desc"; fi; }
 check_fails() { local desc=$1; shift; if "$@"; then fail "$desc"; else pass "$desc"; fi; }
+# Run a command with its output discarded (redirecting a `check` line itself
+# would also hide the ✓/✗ line).
+quiet() { "$@" >/dev/null 2>&1; }
 
 CLOUDCLI="$STUB"
 EXTRA_ARGS=()
@@ -103,7 +107,7 @@ check "20 MB multi-chunk copy"  cmp -s "$WORK/big" "$MNT/big.bin"
 
 check "files owned by user"     [ "$(stat -c %u "$MNT/big.bin")" = "$(id -u)" ]
 check "cp -p works"             cp -p "$MNT/rw.bin" "$MNT/rw-copy.bin"
-check "df works"                df "$MNT" >/dev/null
+check "df works"                quiet df "$MNT"
 
 # ── Rename / delete ──
 echo "moving" > "$MNT/a.txt"
@@ -380,6 +384,43 @@ done
 check "all stress files intact after remount" [ "$STRESS_OK" = 1 ]
 rm -r "$MNT/stress"
 unmount_fs
+
+# ── encfsctl: init, passphrase changes, status ──
+CTL_WORK="$WORK/ctl"; mkdir -p "$CTL_WORK"
+check "init creates a key file"            quiet "$CTL_BIN" init -k "$CTL_WORK/new.key" "$CTL_WORK/keyed"
+check "...with mode 0600"                  [ "$(stat -c %a "$CTL_WORK/new.key")" = 600 ]
+check_fails "init won't overwrite a key"   "$CTL_BIN" init -k "$CTL_WORK/new.key" "$CTL_WORK/other" 2>/dev/null
+
+MAIN_BACK="$BACK"; MAIN_STORE="$ENCFS_STUB_STORE"
+BACK="$CTL_WORK/pass_backing"; export ENCFS_STUB_STORE="$CTL_WORK/pass_cloud"
+pmount() {  # mount the passphrase store with $1
+    ENCFS_PASSPHRASE="$1" "$FS_BIN" -p -c "$STUB" "$MNT" "$BACK" >>"$LOG" 2>&1 &
+    FS_PID=$!
+    for _ in $(seq 50); do mountpoint -q "$MNT" && return 0; kill -0 "$FS_PID" 2>/dev/null || return 1; sleep 0.1; done
+    return 1
+}
+check "init --passphrase"                  quiet env ENCFS_PASSPHRASE=first "$CTL_BIN" init -p "$BACK"
+check_fails "init refuses an existing store" env ENCFS_PASSPHRASE=x "$CTL_BIN" init -p "$BACK" 2>/dev/null
+check_fails "wrong passphrase rejected before any data exists" \
+    env ENCFS_PASSPHRASE=typo "$FS_BIN" -p -c "$STUB" "$MNT" "$BACK" 2>/dev/null
+pmount first || fail "mount with passphrase"
+echo "guarded by a passphrase" > "$MNT/p.txt"
+unmount_fs
+check "passwd changes the passphrase" \
+    quiet env ENCFS_PASSPHRASE=first ENCFS_NEW_PASSPHRASE=second "$CTL_BIN" passwd -c "$STUB" "$BACK"
+check_fails "passwd needs the right current passphrase" \
+    env ENCFS_PASSPHRASE=first ENCFS_NEW_PASSPHRASE=third "$CTL_BIN" passwd -c "$STUB" "$BACK" 2>/dev/null
+check_fails "old passphrase no longer works" \
+    env ENCFS_PASSPHRASE=first "$FS_BIN" -p -c "$STUB" "$MNT" "$BACK" 2>/dev/null
+pmount second || fail "mount with new passphrase"
+check "files intact under the new passphrase" [ "$(cat "$MNT/p.txt")" = "guarded by a passphrase" ]
+unmount_fs
+check "cloud got the new encfs.kdf"        cmp -s "$BACK/encfs.kdf" "$ENCFS_STUB_STORE/encfs.kdf"
+check "restore on a new machine with the new passphrase" \
+    [ "$(ENCFS_PASSPHRASE=second "$DECRYPT_BIN" -p -c "$STUB" "$CTL_WORK/fresh" p.txt - 2>/dev/null)" = "guarded by a passphrase" ]
+STATUS=$(ENCFS_PASSPHRASE=second "$CTL_BIN" status -p "$BACK" 2>&1)
+check "status reports files and the KDF"   bash -c "grep -q 'Files: *1 in 0 directories' <<<\"\$0\" && grep -q 'encfs.kdf v2' <<<\"\$0\"" "$STATUS"
+BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

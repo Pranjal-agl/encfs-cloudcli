@@ -8,6 +8,7 @@
 #include "crypto.h"
 #include "file_codec.h"
 #include "index.h"
+#include "key_setup.h"
 #include "util.h"
 
 #include <openssl/evp.h>
@@ -133,6 +134,16 @@ int Gen(const std::string& dir) {
     Write(dir + "/encfs.kdf", kdf);
     auto pkey = KeyManager::DeriveKeyFromPassphrase("correct horse battery staple", salt, 10000);
     Write(dir + "/kdf_expected.hex", Bytes(HexEncode(pkey.data(), pkey.size())));
+
+    // v2 (wrapped) KDF file, as `encfsctl init --passphrase` writes it.
+    const std::string v2dir = dir + "/kdf_v2";
+    ::mkdir(v2dir.c_str(), 0700);
+    std::vector<uint8_t> wrapped_master;
+    std::string error;
+    if (!CreatePassphraseStore(v2dir, "correct horse battery staple", wrapped_master, error)) {
+        throw std::runtime_error(error);
+    }
+    Write(dir + "/kdf_v2_expected.hex", Bytes(HexEncode(wrapped_master.data(), wrapped_master.size())));
     return 0;
 }
 

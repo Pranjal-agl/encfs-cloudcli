@@ -18,46 +18,83 @@ namespace encfs {
 
 namespace {
 
-const uint8_t kKdfMagic[8] = {'E', 'N', 'C', 'F', 'S', 'K', 'D', 'F'};
+// <backing_dir>/encfs.kdf, two versions:
+//
+//   v1 "ENCFSKDF" | iterations:u32le | salt[16]
+//      master key = PBKDF2(passphrase, salt). Changing the passphrase would
+//      change the key, so it couldn't be changed.
+//   v2 "ENCFSKD2" | iterations:u32le | salt[16] | wrapped[60]
+//      master key is random; wrapped = AES-256-GCM(KEK, master) with
+//      KEK = PBKDF2(passphrase, salt) and the first 28 bytes as AAD.
+//      Changing the passphrase just re-wraps the same master key, and a wrong
+//      passphrase is detected even before any index exists.
+const uint8_t kKdfMagicV1[8] = {'E', 'N', 'C', 'F', 'S', 'K', 'D', 'F'};
+const uint8_t kKdfMagicV2[8] = {'E', 'N', 'C', 'F', 'S', 'K', 'D', '2'};
 constexpr size_t kKdfSaltSize = 16;
+constexpr size_t kKdfHeaderSize = 8 + 4 + kKdfSaltSize;
+constexpr size_t kWrappedSize = 12 + kKeySize + 16;
 constexpr uint32_t kDefaultIterations = 600000;  // OWASP 2023 guidance for PBKDF2-HMAC-SHA256
 constexpr uint32_t kMinIterations = 10000;
 // encfs.kdf can come from the cloud: cap the work factor it can demand so a
 // corrupted or malicious file can't make mounting hang for hours.
 constexpr uint32_t kMaxIterations = 50'000'000;
 
-struct KdfParams {
+struct KdfFile {
+    int version = 2;
     uint32_t iterations = kDefaultIterations;
     std::vector<uint8_t> salt;
+    std::vector<uint8_t> header;   // the authenticated first 28 bytes (v2)
+    std::vector<uint8_t> wrapped;  // v2 only
 };
 
-// <backing_dir>/encfs.kdf: "ENCFSKDF" | iterations:u32le | salt[16]
-bool LoadKdfParams(const std::string& path, KdfParams& params, std::string& error) {
+std::string KdfPath(const std::string& backing_dir) { return backing_dir + "/encfs.kdf"; }
+
+bool LoadKdf(const std::string& path, KdfFile& kdf, std::string& error) {
     std::vector<uint8_t> data;
     if (!ReadWholeFile(path, data)) {
         error = "cannot read " + path + ": " + std::strerror(errno);
         return false;
     }
-    if (data.size() != sizeof(kKdfMagic) + 4 + kKdfSaltSize ||
-        std::memcmp(data.data(), kKdfMagic, sizeof(kKdfMagic)) != 0) {
+    if (data.size() == kKdfHeaderSize && std::memcmp(data.data(), kKdfMagicV1, 8) == 0) {
+        kdf.version = 1;
+    } else if (data.size() == kKdfHeaderSize + kWrappedSize &&
+               std::memcmp(data.data(), kKdfMagicV2, 8) == 0) {
+        kdf.version = 2;
+        kdf.wrapped.assign(data.begin() + kKdfHeaderSize, data.end());
+    } else {
         error = path + " is not a valid KDF parameter file";
         return false;
     }
-    params.iterations = LoadU32LE(data.data() + sizeof(kKdfMagic));
-    if (params.iterations < kMinIterations || params.iterations > kMaxIterations) {
+    kdf.iterations = LoadU32LE(data.data() + 8);
+    if (kdf.iterations < kMinIterations || kdf.iterations > kMaxIterations) {
         error = path + " specifies an unreasonable PBKDF2 iteration count (" +
-                std::to_string(params.iterations) + ")";
+                std::to_string(kdf.iterations) + ")";
         return false;
     }
-    params.salt.assign(data.begin() + sizeof(kKdfMagic) + 4, data.end());
+    kdf.salt.assign(data.begin() + 12, data.begin() + kKdfHeaderSize);
+    kdf.header.assign(data.begin(), data.begin() + kKdfHeaderSize);
     return true;
 }
 
-bool SaveKdfParams(const std::string& path, const KdfParams& params) {
-    std::vector<uint8_t> data(kKdfMagic, kKdfMagic + sizeof(kKdfMagic));
-    AppendU32LE(data, params.iterations);
-    data.insert(data.end(), params.salt.begin(), params.salt.end());
-    return WriteFileAtomic(path, data, 0644);
+// Write a v2 file wrapping `master` under `passphrase` (fresh salt).
+bool WriteWrappedKdf(const std::string& path, const std::vector<uint8_t>& master,
+                     const std::string& passphrase, std::string& error) {
+    std::vector<uint8_t> header(kKdfMagicV2, kKdfMagicV2 + 8);
+    AppendU32LE(header, kDefaultIterations);
+    std::vector<uint8_t> salt = KeyManager::RandomBytes(kKdfSaltSize);
+    header.insert(header.end(), salt.begin(), salt.end());
+
+    std::vector<uint8_t> kek = KeyManager::DeriveKeyFromPassphrase(passphrase, salt, kDefaultIterations);
+    std::vector<uint8_t> wrapped = SimpleCrypto::Encrypt(master, kek, header);
+    SecureWipe(kek);
+
+    std::vector<uint8_t> data = header;
+    data.insert(data.end(), wrapped.begin(), wrapped.end());
+    if (!WriteFileAtomic(path, data, 0644)) {  // not secret without the passphrase
+        error = "cannot write " + path + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
 }
 
 // Read one line from the controlling terminal with echo disabled.
@@ -95,17 +132,20 @@ bool PromptHidden(const std::string& prompt, std::string& out) {
     return ok;
 }
 
-bool GetPassphrase(bool confirm, std::string& passphrase, std::string& error) {
-    if (const char* env = std::getenv("ENCFS_PASSPHRASE")) {
+} // namespace
+
+bool ReadPassphrase(const char* env_var, const std::string& prompt, bool confirm,
+                    std::string& passphrase, std::string& error) {
+    if (const char* env = std::getenv(env_var)) {
         passphrase = env;
     } else {
-        if (!PromptHidden("Passphrase: ", passphrase)) {
-            error = "no passphrase: set ENCFS_PASSPHRASE or run from a terminal";
+        if (!PromptHidden(prompt + ": ", passphrase)) {
+            error = std::string("no passphrase: set ") + env_var + " or run from a terminal";
             return false;
         }
         if (confirm) {
             std::string again;
-            bool same = PromptHidden("Confirm passphrase: ", again) && again == passphrase;
+            bool same = PromptHidden("Confirm " + prompt + ": ", again) && again == passphrase;
             SecureWipe(again);
             if (!same) {
                 SecureWipe(passphrase);
@@ -121,34 +161,69 @@ bool GetPassphrase(bool confirm, std::string& passphrase, std::string& error) {
     return true;
 }
 
+bool PassphraseStoreExists(const std::string& backing_dir) {
+    struct stat st;
+    return ::stat(KdfPath(backing_dir).c_str(), &st) == 0;
+}
+
+bool CreatePassphraseStore(const std::string& backing_dir, const std::string& passphrase,
+                           std::vector<uint8_t>& master, std::string& error) {
+    if (PassphraseStoreExists(backing_dir)) {
+        error = KdfPath(backing_dir) + " already exists";
+        return false;
+    }
+    std::vector<uint8_t> key = KeyManager::RandomBytes(kKeySize);
+    if (!WriteWrappedKdf(KdfPath(backing_dir), key, passphrase, error)) return false;
+    master.swap(key);
+    return true;
+}
+
+bool UnlockPassphraseStore(const std::string& backing_dir, const std::string& passphrase,
+                           std::vector<uint8_t>& master, std::string& error, int* kdf_version) {
+    KdfFile kdf;
+    if (!LoadKdf(KdfPath(backing_dir), kdf, error)) return false;
+    if (kdf_version) *kdf_version = kdf.version;
+    std::vector<uint8_t> derived = KeyManager::DeriveKeyFromPassphrase(
+        passphrase, kdf.salt, static_cast<int>(kdf.iterations));
+    if (kdf.version == 1) {
+        master.swap(derived);  // v1: the derived key is the master key
+        return true;
+    }
+    try {
+        std::vector<uint8_t> key = SimpleCrypto::Decrypt(kdf.wrapped, derived, kdf.header);
+        SecureWipe(derived);
+        if (key.size() != kKeySize) throw std::runtime_error("bad key size");
+        master.swap(key);
+        return true;
+    } catch (const std::exception&) {
+        SecureWipe(derived);
+        error = "wrong passphrase";
+        return false;
+    }
+}
+
+bool RewrapPassphraseStore(const std::string& backing_dir, const std::vector<uint8_t>& master,
+                           const std::string& new_passphrase, std::string& error) {
+    return WriteWrappedKdf(KdfPath(backing_dir), master, new_passphrase, error);
+}
+
+namespace {
+
 bool KeyFromPassphrase(const std::string& backing_dir, bool allow_create,
                        std::vector<uint8_t>& key, std::string& error) {
-    std::string kdf_path = backing_dir + "/encfs.kdf";
-    KdfParams params;
-    bool creating = false;
-
-    struct stat st;
-    if (::stat(kdf_path.c_str(), &st) == 0) {
-        if (!LoadKdfParams(kdf_path, params, error)) return false;
-    } else if (!allow_create) {
-        error = "no " + kdf_path + " — this backing directory was not set up with --passphrase";
+    const bool exists = PassphraseStoreExists(backing_dir);
+    if (!exists && !allow_create) {
+        error = "no " + KdfPath(backing_dir) + " — this backing directory was not set up with --passphrase";
         return false;
-    } else {
-        params.salt = KeyManager::RandomBytes(kKdfSaltSize);
-        creating = true;
     }
-
     std::string passphrase;
-    if (!GetPassphrase(creating, passphrase, error)) return false;
-    key = KeyManager::DeriveKeyFromPassphrase(passphrase, params.salt,
-                                              static_cast<int>(params.iterations));
-    SecureWipe(passphrase);
-
-    if (creating && !SaveKdfParams(kdf_path, params)) {
-        error = "cannot write " + kdf_path + ": " + std::strerror(errno);
+    if (!ReadPassphrase("ENCFS_PASSPHRASE", "Passphrase", /*confirm=*/!exists, passphrase, error)) {
         return false;
     }
-    return true;
+    bool ok = exists ? UnlockPassphraseStore(backing_dir, passphrase, key, error)
+                     : CreatePassphraseStore(backing_dir, passphrase, key, error);
+    SecureWipe(passphrase);
+    return ok;
 }
 
 void WarnIfKeyFileExposed(const std::string& path) {
