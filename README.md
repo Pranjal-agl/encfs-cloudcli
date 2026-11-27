@@ -223,16 +223,19 @@ Set `ENCFS_STUB_FAIL=1` to make the stub fail every command, which is useful for
 ## Tests
 
 ```bash
-ctest --test-dir build --output-on-failure      # unit + integration
+ctest --test-dir build --output-on-failure      # all suites (add -DENCFS_E2E=ON for FUSE)
 ./run_and_prove.sh                              # build, all tests incl. FUSE e2e, live demo
 ```
 
 - **test_crypto**: RFC 4231 HMAC vector; round trips at every chunk boundary; a single-bit flip at *every* byte position of a blob; truncation, extension, reordering, cross-file splicing and header grafting; streaming ↔ in-memory interoperability; v1 compatibility.
 - **test_index**: persistence, wrong key/corruption handling (state left untouched), on-disk format stability, unusual filenames.
 - **test_integration**: blob ↔ file/version binding, key resolution (hex, raw, legacy, wrong key, passphrase), the cloudcli wrapper against the stub (including shell-metacharacter paths), queue coalescing, retries and journal recovery.
-- **tests/e2e/run_e2e.sh**: mounts the real filesystem and drives it with `echo`, `cat`, `dd`, `truncate`, `mv`, `cp -p`, `touch -d`. Also checks that the cloud matches the backing dir after unmount, that evicted blobs are re-downloaded, and that tampered or swapped blobs and wrong keys are rejected.
+- **tests/e2e/run_e2e.sh**: mounts the real filesystem and drives it with `echo`, `cat`, `dd`, `truncate`, `mv`, `cp -p`, `touch -d`. Also checks that the cloud matches the backing dir after unmount, that evicted blobs are re-downloaded, and that tampered or swapped blobs and wrong keys are rejected. It also covers directories, restoring from the cloud alone, the cache limit (including with the cloud down), and `decrypt_by_name --verify`/`--extract-all`.
+- **test_contents**: thousands of random writes, truncates, reads and save-and-rebase cycles on `FileContents`, checked against an in-memory model with a 2-chunk cache to force spilling.
+- **tests/web**: `web/encfs.js` and the C++ code read each other's blobs and indexes.
+- **Fuzzing** (`-DENCFS_FUZZ=ON` with clang): libFuzzer targets for the blob decoders and random-access reader (`fuzz_blob`), the index deserializer (`fuzz_index`, whose inputs are encrypted with the real key so they reach the parser), differential checks of `FileContents` against a model (`fuzz_contents`), and the sync journal (`fuzz_journal`).
 
-CI runs everything, including the FUSE tests, in Release and in ASan/UBSan builds, and lints the shell scripts with shellcheck.
+CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan builds. It also fuzzes each target for 60 s and lints the shell scripts with shellcheck.
 
 ---
 
@@ -267,6 +270,11 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v2.8 — fuzzing
+
+- Four libFuzzer targets with seed corpora: blob decoders, index deserializer, `FileContents` checked differentially against a model, and the sync journal. CI fuzzes each for 60 s per run and uploads any crashing inputs.
+- `encfs.kdf` now has an upper bound on PBKDF2 iterations (50M). It can arrive from the cloud, and a huge count would have made mounting hang.
 
 ### v2.7 — bounded local cache
 

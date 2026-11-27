@@ -194,6 +194,19 @@ void TestPassphraseMode() {
     index.SetMetadata("f", FileMetadata());
     CHECK(index.Save());
 
+    // A KDF file demanding an absurd work factor (it may come from the cloud)
+    // is refused rather than hanging the mount.
+    {
+        TempDir evil;
+        std::vector<uint8_t> kdf = Bytes("ENCFSKDF");
+        AppendU32LE(kdf, 4000000000u);
+        kdf.insert(kdf.end(), 16, 0x11);
+        CHECK(WriteFileAtomic(evil / "encfs.kdf", kdf));
+        std::vector<uint8_t> k3;
+        CHECK(!ResolveMasterKey(opts, evil.path(), false, k3, err));
+        CHECK(err.find("unreasonable") != std::string::npos);
+    }
+
     setenv("ENCFS_PASSPHRASE", "wrong", 1);
     CHECK(!ResolveMasterKey(opts, dir.path(), false, k2, err));
     CHECK(err.find("wrong passphrase") != std::string::npos);
