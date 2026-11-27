@@ -309,6 +309,78 @@ unmount_fs
 EXTRA_ARGS=()
 BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
 
+# ── Concurrency ──
+# A slow download of one file must not stall the rest of the filesystem.
+SLOW="$WORK/slow_cloudcli"
+cat > "$SLOW" <<SLOW_EOF
+#!/usr/bin/env bash
+if [ "\$1" = download ] && [ -e "$WORK/slow_on" ]; then sleep 4; fi
+exec "$STUB" "\$@"
+SLOW_EOF
+chmod +x "$SLOW"
+mount_fs || fail "mount for concurrency tests"
+head -c 300000 /dev/urandom > "$WORK/slow_src"
+cp "$WORK/slow_src" "$MNT/slow.bin"
+echo "fast" > "$MNT/fast.txt"
+unmount_fs
+find "$BACK" -name '*.enc' ! -name index.enc -delete   # force downloads
+CLOUDCLI="$SLOW"
+mount_fs || fail "mount with slow cloud"
+cat "$MNT/fast.txt" >/dev/null   # fetch this one before the cloud slows down
+touch "$WORK/slow_on"
+START=$(date +%s.%N)
+cat "$MNT/slow.bin" > "$WORK/slow_out" &
+SLOW_PID=$!
+sleep 0.5
+T0=$(date +%s.%N)
+ls "$MNT" >/dev/null
+cat "$MNT/fast.txt" >/dev/null
+echo "meanwhile" > "$MNT/meanwhile.txt"
+T1=$(date +%s.%N)
+wait "$SLOW_PID"
+END=$(date +%s.%N)
+rm -f "$WORK/slow_on"
+check "slow download really was slow"     [ "$(echo "$END - $START > 3.5" | bc)" = 1 ]
+check "other operations didn't wait for it" [ "$(echo "$T1 - $T0 < 1.5" | bc)" = 1 ]
+check "slow file arrived intact"          cmp -s "$WORK/slow_src" "$WORK/slow_out"
+unmount_fs
+CLOUDCLI="$STUB"
+
+# Many writers, readers and renamers at once.
+mount_fs || fail "mount for stress test"
+mkdir "$MNT/stress"
+worker() {
+    local w=$1
+    for i in $(seq 25); do
+        local f="$MNT/stress/w${w}_$i"
+        printf 'worker %s round %s\n' "$w" "$i" > "$f"
+        printf 'appended %s\n' "$i" >> "$f"
+        printf 'X' | dd of="$f" bs=1 seek=0 conv=notrunc status=none
+        mv "$f" "$f.done"
+        [ "$(head -c 7 "$f.done")" = "Xorker " ] || echo "bad $f.done" >> "$WORK/stress_errors"
+        if [ $((i % 5)) = 0 ]; then rm "$f.done"; fi
+    done
+}
+STRESS_PIDS=()
+for w in 1 2 3 4 5 6 7 8; do worker "$w" & STRESS_PIDS+=($!); done
+( for _ in $(seq 40); do find "$MNT/stress" -type f -exec cat {} + >/dev/null 2>&1; done ) &
+STRESS_PIDS+=($!)
+wait "${STRESS_PIDS[@]}"   # not a bare `wait`: that would also wait for the daemon
+check "no worker saw a corrupt file"      [ ! -e "$WORK/stress_errors" ]
+check "every surviving file is present"   [ "$(find "$MNT/stress" -type f | wc -l)" = 160 ]
+unmount_fs
+mount_fs || fail "remount after stress test"
+STRESS_OK=1
+for w in 1 2 3 4 5 6 7 8; do
+    for i in $(seq 25); do
+        [ $((i % 5)) = 0 ] && continue
+        [ "$(cat "$MNT/stress/w${w}_$i.done")" = "$(printf 'Xorker %s round %s\nappended %s' "$w" "$i" "$i")" ] || STRESS_OK=0
+    done
+done
+check "all stress files intact after remount" [ "$STRESS_OK" = 1 ]
+rm -r "$MNT/stress"
+unmount_fs
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "✓ All end-to-end tests passed"

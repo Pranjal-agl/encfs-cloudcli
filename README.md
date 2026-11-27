@@ -18,6 +18,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Background sync** — uploads and deletes run in a worker thread with retries and exponential back-off; redundant operations are coalesced
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
 - **Constant memory, any file size** — reads decrypt only the chunks they touch, and writes keep only a few chunks in RAM. Copying in a 1 GB file peaks at 21 MB, where buffering it whole took about 2 GB.
+- **Concurrent** — FUSE runs multi-threaded with per-file locking, so a slow download of one file doesn't stall `ls`, other reads or other writes
 - **Bounded local cache** — with `--cache-size 20G` the backing directory becomes a cache. Blobs the cloud provably holds at their current version are evicted least-recently-used first, and nothing is evicted while an upload is pending.
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
@@ -41,7 +42,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 │  truncate flush fsync release unlink rename │
 │  mkdir rmdir                                │
 │  utimens chmod chown statfs                 │
-│  (shared per-file buffers, one big lock)    │
+│  (multi-threaded, per-file locks)           │
 └──────┬──────────────┬───────────────┬───────┘
        │              │               │
 ┌──────▼───────┐ ┌────▼───────┐ ┌─────▼────────────┐
@@ -56,6 +57,16 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 ```
 
 `file_contents.cpp` holds an open file's contents in bounded memory, described in the next section. `key_setup.cpp` (key files and passphrases) and `util.cpp` (atomic file writes, little-endian encoding) are shared by the filesystem and the `decrypt_by_name` tool.
+
+### Concurrency
+
+FUSE calls the filesystem from several threads. The locks are strictly ordered, and a thread only takes a lock lower in the list than any it already holds:
+
+1. **Namespace lock**: open-file table, handles, refcounts, and the operations that add, remove or rename entries. It's held briefly, except by `rename`, which re-encrypts.
+2. **Per-file lock**: one file's contents. Downloads, reads, writes and saves run under this lock alone.
+3. **Leaf locks**: the index, the synced-version map, the first-save guard, and the sync queue.
+
+Code holding a file lock never takes the namespace lock. Work that needs it, such as cache eviction, is flagged and done after the file lock is released. `unlink` and `rename` take the affected file's lock, so they wait for a save in progress instead of racing it.
 
 ### Open files in bounded memory
 
@@ -270,6 +281,13 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v2.9 — concurrency
+
+- FUSE now runs multi-threaded (no more `-s`), with a three-level lock order: namespace, per-file, leaf. Downloads, reads, writes and saves hold only their file's lock.
+- With downloads slowed to 4 s, `ls`, reading another file and creating a new one all finish while the download is still in progress. Before, they waited for it.
+- New e2e tests: the slow-cloud check, and a stress test with 8 workers each running 25 rounds of create, append, partial overwrite, rename, read-back and delete, alongside a reader walking the tree. Every file is verified after remount.
+- Three full e2e runs under ThreadSanitizer: no reports.
 
 ### v2.8 — fuzzing
 
