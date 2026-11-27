@@ -34,4 +34,32 @@ bool ResolveMasterKey(const KeyOptions& options,
                       std::vector<uint8_t>& master_key,
                       std::string& error);
 
+// ── Passphrase-protected stores ─────────────────────────────────────────────
+// <backing_dir>/encfs.kdf. Version 2 (written by everything new) stores a
+// random master key wrapped with a passphrase-derived key, so the passphrase
+// can be changed without re-encrypting anything. Version 1 files (master key
+// derived directly from the passphrase) are still read, and RewrapPassphraseStore
+// upgrades them in place.
+
+// Read a passphrase from `env_var`, or prompt on the terminal (twice if
+// `confirm`). Returns false with `error` set on failure or empty input.
+bool ReadPassphrase(const char* env_var, const std::string& prompt, bool confirm,
+                    std::string& passphrase, std::string& error);
+
+bool PassphraseStoreExists(const std::string& backing_dir);
+
+// Create encfs.kdf (v2) around a new random master key.
+bool CreatePassphraseStore(const std::string& backing_dir, const std::string& passphrase,
+                           std::vector<uint8_t>& master, std::string& error);
+
+// Recover the master key. Fails with "wrong passphrase" for v2 files.
+// (v1 files can't tell; ResolveMasterKey checks those against the index.)
+bool UnlockPassphraseStore(const std::string& backing_dir, const std::string& passphrase,
+                           std::vector<uint8_t>& master, std::string& error,
+                           int* kdf_version = nullptr);
+
+// Replace encfs.kdf with a v2 file wrapping `master` under `new_passphrase`.
+bool RewrapPassphraseStore(const std::string& backing_dir, const std::vector<uint8_t>& master,
+                           const std::string& new_passphrase, std::string& error);
+
 } // namespace encfs

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(encfs-cloudcli VERSION 2.9.0 LANGUAGES CXX)
+project(encfs-cloudcli VERSION 2.10.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,7 +66,10 @@ target_link_libraries(encrypted_cloudfs PRIVATE encfs_core PkgConfig::FUSE3)
 add_executable(decrypt_by_name tools/decrypt_by_name.cpp)
 target_link_libraries(decrypt_by_name PRIVATE encfs_core)
 
-install(TARGETS encrypted_cloudfs decrypt_by_name RUNTIME DESTINATION bin)
+add_executable(encfsctl tools/encfsctl.cpp)
+target_link_libraries(encfsctl PRIVATE encfs_core)
+
+install(TARGETS encrypted_cloudfs decrypt_by_name encfsctl RUNTIME DESTINATION bin)
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 enable_testing()
@@ -94,6 +97,7 @@ if(ENCFS_E2E)
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/run_e2e.sh
                      $<TARGET_FILE:encrypted_cloudfs>
                      $<TARGET_FILE:decrypt_by_name>
+                     $<TARGET_FILE:encfsctl>
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/cloudcli_stub)
     set_tests_properties(test_e2e_fuse PROPERTIES TIMEOUT 120)
 endif()

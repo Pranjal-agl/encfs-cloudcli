@@ -213,6 +213,54 @@ void TestPassphraseMode() {
     unsetenv("ENCFS_PASSPHRASE");
 }
 
+void TestKeyWrapping() {
+    TempDir dir;
+    std::vector<uint8_t> master, again, other;
+    std::string err;
+
+    // v2: random master key, wrapped; wrong passphrases are detected on their own.
+    CHECK(CreatePassphraseStore(dir.path(), "alpha", master, err));
+    CHECK(master.size() == 32);
+    CHECK(!CreatePassphraseStore(dir.path(), "alpha", other, err));  // won't clobber
+    CHECK(UnlockPassphraseStore(dir.path(), "alpha", again, err) && again == master);
+    CHECK(!UnlockPassphraseStore(dir.path(), "beta", other, err) && err == "wrong passphrase");
+
+    // Changing the passphrase keeps the master key, so no data changes.
+    CHECK(RewrapPassphraseStore(dir.path(), master, "beta", err));
+    CHECK(!UnlockPassphraseStore(dir.path(), "alpha", other, err));
+    CHECK(UnlockPassphraseStore(dir.path(), "beta", again, err) && again == master);
+
+    // Tampering with the header (e.g. lowering the iteration count) is caught.
+    std::vector<uint8_t> kdf;
+    CHECK(ReadWholeFile(dir / "encfs.kdf", kdf) && kdf.size() == 88);
+    kdf[8] ^= 1;
+    CHECK(WriteFileAtomic(dir / "encfs.kdf", kdf));
+    CHECK(!UnlockPassphraseStore(dir.path(), "beta", other, err));
+}
+
+void TestKdfV1Upgrade() {
+    TempDir dir;
+    // A v1 file, as written by earlier versions: master = PBKDF2(passphrase).
+    std::vector<uint8_t> salt(16, 0x33), kdf = Bytes("ENCFSKDF");
+    AppendU32LE(kdf, 10000);
+    kdf.insert(kdf.end(), salt.begin(), salt.end());
+    CHECK(WriteFileAtomic(dir / "encfs.kdf", kdf));
+    const auto v1_master = KeyManager::DeriveKeyFromPassphrase("old pass", salt, 10000);
+
+    std::vector<uint8_t> master;
+    std::string err;
+    int version = 0;
+    CHECK(UnlockPassphraseStore(dir.path(), "old pass", master, err, &version));
+    CHECK(version == 1 && master == v1_master);
+
+    // Re-wrapping upgrades the file to v2 around the *same* master key, so
+    // everything encrypted under v1 stays readable.
+    CHECK(RewrapPassphraseStore(dir.path(), master, "new pass", err));
+    std::vector<uint8_t> after;
+    CHECK(UnlockPassphraseStore(dir.path(), "new pass", after, err, &version));
+    CHECK(version == 2 && after == v1_master);
+}
+
 // ── cloudcli wrapper (against tools/cloudcli_stub) ──────────────────────────
 
 void TestSyncCommands() {
@@ -358,6 +406,8 @@ int main() {
         {"FileCodec random-access reader", TestCodecReader},
         {"Master key resolution (hex, wrong key, legacy)", TestResolveMasterKey},
         {"Passphrase-derived keys", TestPassphraseMode},
+        {"Key wrapping: create, unlock, re-wrap, tamper", TestKeyWrapping},
+        {"v1 passphrase stores upgrade in place", TestKdfV1Upgrade},
         {"cloudcli upload/download/delete via stub", TestSyncCommands},
         {"Background queue coalesces and drains", TestBackgroundQueueCoalesces},
         {"Failed ops are retried and journaled", TestRetriesAndJournalRecovery},

@@ -287,7 +287,10 @@ async function unlock() {
       const kdf = vault.files.get("encfs.kdf");
       if (!kdf) throw new Error("This folder has no encfs.kdf, so it wasn’t set up with a passphrase.");
       status.textContent = "Deriving the key from your passphrase…";
-      const master = await encfs.keyFromPassphrase($("#passphrase").value, await readFile(kdf));
+      let master;
+      try { master = await encfs.keyFromPassphrase($("#passphrase").value, await readFile(kdf)); }
+      catch (e) { throw new Error(e instanceof encfs.AuthError ? "That passphrase is wrong." : e.message); }
+      status.textContent = "";
       vault.keys = await encfs.deriveKeys(master);
       try { vault.entries = await encfs.decryptIndex(vault.keys, indexBytes); }
       catch { throw new Error("That passphrase can’t decrypt this index."); }
