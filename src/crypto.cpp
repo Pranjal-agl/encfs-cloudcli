@@ -507,6 +507,53 @@ bool ChunkedCrypto::DecryptStream(
     return ok;
 }
 
+// ── ChunkedWriter ───────────────────────────────────────────────────────────
+
+ChunkedWriter::ChunkedWriter(std::function<bool(const uint8_t*, size_t)> write_fn,
+                             const std::vector<uint8_t>& key,
+                             size_t chunk_size,
+                             const std::vector<uint8_t>& aad)
+    : write_fn_(std::move(write_fn)), chunk_size_(chunk_size) {
+    if (key.size() != kKeySize || chunk_size == 0 || chunk_size > ChunkedCrypto::MAX_CHUNK_SIZE) {
+        ok_ = false;
+        return;
+    }
+    std::vector<uint8_t> salt = KeyManager::RandomBytes(kSaltSize);
+    header_ = BuildHeader(chunk_size, salt);
+    file_key_ = FileKey(key, salt.data());
+    full_aad_ = Concat(header_, aad);
+}
+
+ChunkedWriter::~ChunkedWriter() {
+    SecureWipe(file_key_);
+    SecureWipe(buf_);
+}
+
+bool ChunkedWriter::Add(const uint8_t* data, size_t len, bool last) {
+    if (!ok_ || finished_) return false;
+    if (len > chunk_size_ || (!last && len != chunk_size_) || index_ > UINT32_MAX) {
+        ok_ = false;
+        return false;
+    }
+    if (!header_written_) {
+        if (!write_fn_(header_.data(), header_.size())) return ok_ = false;
+        header_written_ = true;
+    }
+    uint8_t nonce[kNonceSize];
+    ChunkNonce(static_cast<uint32_t>(index_), last, nonce);
+    buf_.clear();
+    AppendU32LE(buf_, static_cast<uint32_t>(len));
+    buf_.resize(4 + len + kTagSize);
+    if (!GcmEncrypt(file_key_.data(), nonce, full_aad_.data(), full_aad_.size(),
+                    data, len, buf_.data() + 4, buf_.data() + 4 + len) ||
+        !write_fn_(buf_.data(), buf_.size())) {
+        return ok_ = false;
+    }
+    ++index_;
+    finished_ = last;
+    return true;
+}
+
 // ── ChunkedReader ───────────────────────────────────────────────────────────
 
 namespace {

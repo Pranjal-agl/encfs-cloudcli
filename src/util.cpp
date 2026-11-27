@@ -150,6 +150,53 @@ bool WriteFileAtomic(const std::string& path, const uint8_t* data, size_t len, u
     return true;
 }
 
+AtomicFile::AtomicFile(std::string path, unsigned mode) : path_(std::move(path)), mode_(mode) {}
+
+AtomicFile::~AtomicFile() {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        ::unlink(tmp_path_.c_str());
+    }
+}
+
+bool AtomicFile::Open() {
+    std::string tmpl = path_ + ".tmp.XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    fd_ = ::mkostemp(buf.data(), O_CLOEXEC);
+    if (fd_ < 0) return false;
+    tmp_path_ = buf.data();
+    return ::fchmod(fd_, static_cast<mode_t>(mode_)) == 0;
+}
+
+bool AtomicFile::Write(const uint8_t* data, size_t len) {
+    if (fd_ < 0 || !ok_) return false;
+    ok_ = WriteAll(fd_, data, len);
+    return ok_;
+}
+
+bool AtomicFile::Commit() {
+    if (fd_ < 0 || !ok_) return false;
+    bool ok = ::fsync(fd_) == 0;
+    int saved = errno;
+    if (::close(fd_) != 0 && ok) {
+        ok = false;
+        saved = errno;
+    }
+    fd_ = -1;
+    if (ok && ::rename(tmp_path_.c_str(), path_.c_str()) != 0) {
+        ok = false;
+        saved = errno;
+    }
+    if (!ok) {
+        ::unlink(tmp_path_.c_str());
+        errno = saved;
+        return false;
+    }
+    FsyncParentDir(path_);
+    return true;
+}
+
 void SecureWipe(std::vector<uint8_t>& buf) {
     if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
 }

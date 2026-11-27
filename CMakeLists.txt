@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(encfs-cloudcli VERSION 2.5.0 LANGUAGES CXX)
+project(encfs-cloudcli VERSION 2.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,7 @@ add_library(encfs_core STATIC
     src/util.cpp
     src/index.cpp
     src/file_codec.cpp
+    src/file_contents.cpp
     src/key_setup.cpp
     src/cloudcli_wrapper.cpp
 )
@@ -62,6 +63,10 @@ add_test(NAME test_crypto COMMAND test_crypto)
 add_executable(test_index tests/unit/test_index.cpp)
 target_link_libraries(test_index PRIVATE encfs_core)
 add_test(NAME test_index COMMAND test_index)
+
+add_executable(test_contents tests/unit/test_contents.cpp)
+target_link_libraries(test_contents PRIVATE encfs_core)
+add_test(NAME test_contents COMMAND test_contents)
 
 add_executable(test_integration tests/integration/test_integration.cpp)
 target_link_libraries(test_integration PRIVATE encfs_core)

@@ -34,6 +34,28 @@ inline bool WriteFileAtomic(const std::string& path, const std::vector<uint8_t>&
     return WriteFileAtomic(path, data.data(), data.size(), mode);
 }
 
+// Streaming counterpart of WriteFileAtomic: Open() creates a temp file next
+// to `path`, Write() appends, Commit() fsyncs and renames it into place. If
+// Commit() isn't reached (or fails) the temp file is removed.
+class AtomicFile {
+public:
+    explicit AtomicFile(std::string path, unsigned mode = 0600);
+    ~AtomicFile();
+    AtomicFile(const AtomicFile&) = delete;
+    AtomicFile& operator=(const AtomicFile&) = delete;
+
+    bool Open();
+    bool Write(const uint8_t* data, size_t len);
+    bool Commit();
+
+private:
+    std::string path_;
+    std::string tmp_path_;
+    unsigned mode_;
+    int fd_ = -1;
+    bool ok_ = true;
+};
+
 // Overwrite a buffer with zeros in a way the optimiser can't elide.
 void SecureWipe(std::vector<uint8_t>& buf);
 void SecureWipe(std::string& buf);

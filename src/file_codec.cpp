@@ -129,4 +129,13 @@ FileCodec::Result FileCodec::OpenReader(const std::string& path,
     return Result::kCorrupt;
 }
 
+std::unique_ptr<ChunkedWriter> FileCodec::NewWriter(std::function<bool(const uint8_t*, size_t)> write_fn,
+                                                    const std::string& remote_id,
+                                                    uint64_t version,
+                                                    size_t chunk_size) const {
+    return std::make_unique<ChunkedWriter>(std::move(write_fn), content_key_,
+                                           chunk_size ? chunk_size : chunk_size_,
+                                           Aad(remote_id, version));
+}
+
 } // namespace encfs

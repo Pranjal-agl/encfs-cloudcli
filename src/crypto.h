@@ -177,6 +177,39 @@ private:
     std::vector<uint8_t> ct_;
 };
 
+// Incremental writer for the v2 blob format: emits the header, then chunks
+// one at a time, so a blob of any size can be produced in constant memory.
+// Every chunk except the last must be exactly chunk_size bytes.
+class ChunkedWriter {
+public:
+    ChunkedWriter(std::function<bool(const uint8_t*, size_t)> write_fn,
+                  const std::vector<uint8_t>& key,
+                  size_t chunk_size,
+                  const std::vector<uint8_t>& aad = {});
+    ~ChunkedWriter();
+
+    ChunkedWriter(const ChunkedWriter&) = delete;
+    ChunkedWriter& operator=(const ChunkedWriter&) = delete;
+
+    // Encrypt and emit the next chunk. Returns false on a size-rule violation,
+    // too many chunks, an encryption failure or a write failure. After
+    // `last` is passed, further calls fail.
+    bool Add(const uint8_t* data, size_t len, bool last);
+    bool finished() const { return finished_; }
+
+private:
+    std::function<bool(const uint8_t*, size_t)> write_fn_;
+    size_t chunk_size_;
+    std::vector<uint8_t> file_key_;
+    std::vector<uint8_t> full_aad_;
+    std::vector<uint8_t> buf_;
+    uint64_t index_ = 0;
+    bool ok_ = true;
+    bool header_written_ = false;
+    bool finished_ = false;
+    std::vector<uint8_t> header_;
+};
+
 // Single-shot AES-256-GCM for small data such as the index.
 // Layout: nonce(12) | ciphertext | tag(16).
 class SimpleCrypto {
