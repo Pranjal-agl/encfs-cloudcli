@@ -470,6 +470,7 @@ int Persist(OpenFile& file) {
     // Write the changed segments as new objects.
     std::vector<std::string> written;
     std::vector<uint8_t> chunk;
+    const std::vector<uint8_t> zeros(g_ctx->pad ? cs : 1);  // padding source (never null)
     auto abandon = [&](const std::string& what) {
         int err = errno ? errno : EIO;
         for (const auto& id : written) ::unlink(BlobPath(id).c_str());
@@ -492,14 +493,14 @@ int Persist(OpenFile& file) {
         for (uint64_t k = 0; k < n_chunks && ok; ++k) {
             const uint64_t offset = k * cs;
             const size_t len = static_cast<size_t>(std::min<uint64_t>(cs, stored - std::min(stored, offset)));
+            const uint8_t* data = zeros.data();  // padding
             if (offset < length) {
                 // A base chunk that fails authentication stops the save:
                 // tampered data is never re-sealed as genuine.
                 ok = contents.LoadChunk(i * chunks_per_segment + k, chunk);
-            } else {
-                chunk.assign(cs, 0);  // padding
+                data = chunk.data();
             }
-            ok = ok && writer->Add(chunk.data(), len, k + 1 == n_chunks);
+            ok = ok && writer->Add(data, len, k + 1 == n_chunks);
         }
         SecureWipe(chunk);
         if (!ok || !writer->finished() || !out.Commit()) return abandon("cannot write segment " + object);
