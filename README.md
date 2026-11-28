@@ -44,7 +44,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 │           encrypted_cloudfs.cpp             │
 │  getattr readdir open create read write     │
 │  truncate flush fsync release unlink rename │
-│  mkdir rmdir                                │
+│  mkdir rmdir link symlink readlink          │
 │  utimens chmod chown statfs                 │
 │  (multi-threaded, per-file locks)           │
 └──────┬──────────────┬───────────────┬───────┘
@@ -52,7 +52,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 ┌──────▼───────┐ ┌────▼───────┐ ┌─────▼────────────┐
 │file_codec.cpp│ │ index.cpp  │ │cloudcli_wrapper  │
 │ key derivation│ │ encrypted  │ │ worker thread,   │
-│ blob ⇄ file   │ │ name→ID map│ │ retries, journal │
+│ blob ⇄ file   │ │path→inode  │ │ retries, journal │
 ├──────────────┤ └────────────┘ └─────┬────────────┘
 │  crypto.cpp  │                      │ posix_spawn (no shell)
 │ AES-256-GCM  │              ┌───────▼───────┐
@@ -60,7 +60,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 └──────────────┘              └───────────────┘
 ```
 
-`file_contents.cpp` holds an open file's contents in bounded memory, described in the next section. `key_setup.cpp` (key files and passphrases) and `util.cpp` (atomic file writes, little-endian encoding) are shared by the filesystem and the `decrypt_by_name` tool.
+`file_contents.cpp` holds an open file's contents in bounded memory, described in the next section. `segments.cpp` names a file's segment objects and reads a segmented file lazily. `index_sync.cpp` keeps several machines' indexes consistent, and `rekey.cpp` implements key rotation and key IDs. `key_setup.cpp` (key files and passphrases) and `util.cpp` (atomic file writes, little-endian encoding, the backing-directory lock) are shared by the filesystem, `decrypt_by_name` and `encfsctl`.
 
 ### Concurrency
 
