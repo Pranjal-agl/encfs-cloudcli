@@ -446,6 +446,90 @@ mount_fs || fail "mount to clean up"
 rm -r "$MNT/ino"
 unmount_fs
 
+# ── Several machines sharing one cloud store ──
+# Machines A and B: separate backing dirs (and mount points), same cloud + key.
+MM="$WORK/mm"; mkdir -p "$MM/mntA" "$MM/mntB"
+MAIN_STORE="$ENCFS_STUB_STORE"; export ENCFS_STUB_STORE="$MM/cloud"
+mm_mount() {  # mm_mount <A|B> [args...]; sets MM_PID
+    local m=$1; shift
+    "$FS_BIN" -k "$KEY" -c "$STUB" "$@" "$MM/mnt$m" "$MM/back$m" >>"$LOG" 2>&1 &
+    MM_PID=$!
+    for _ in $(seq 50); do mountpoint -q "$MM/mnt$m" && return 0; kill -0 "$MM_PID" 2>/dev/null || return 1; sleep 0.1; done
+    return 1
+}
+mm_umount() { fusermount3 -u "$MM/mnt$1"; while kill -0 "$2" 2>/dev/null; do sleep 0.1; done; }
+mm_refused() {  # the mount must exit by itself (refused) instead of mounting
+    local m=$1; shift
+    if timeout 10 "$FS_BIN" -k "$KEY" -c "$STUB" "$@" "$MM/mnt$m" "$MM/back$m" >"$MM/refusal" 2>&1; then
+        return 1
+    fi
+    if mountpoint -q "$MM/mnt$m"; then fusermount3 -u "$MM/mnt$m"; return 1; fi
+    return 0
+}
+cloud_list() { rm -rf "$MM/peek"; "$DECRYPT_BIN" -k "$KEY" -c "$STUB" --list "$MM/peek" 2>/dev/null | cut -f2 | tr '\n' ' '; }
+
+# Hand-off: A writes, B restores and writes, A picks B's change up.
+mm_mount A || fail "mount A"; echo one > "$MM/mntA/f1"; mm_umount A "$MM_PID"
+mm_mount B || fail "mount B"
+check "B restores A's file"              [ "$(cat "$MM/mntB/f1")" = one ]
+echo two > "$MM/mntB/f2"; mm_umount B "$MM_PID"
+mm_mount A || fail "remount A"
+check "A adopts B's newer index"         [ "$(cat "$MM/mntA/f2")" = two ]
+echo "one, edited on A" > "$MM/mntA/f1"; mm_umount A "$MM_PID"
+mm_mount B || fail "remount B"
+check "B sees A's edit (stale blob dropped)" [ "$(cat "$MM/mntB/f1")" = "one, edited on A" ]
+mm_umount B "$MM_PID"
+
+# Conflict: A changes things offline while B changes the cloud.
+export ENCFS_STUB_FAIL=1
+mm_mount A || fail "mount A offline"; echo "A offline" > "$MM/mntA/fA"; mm_umount A "$MM_PID"
+unset ENCFS_STUB_FAIL
+mm_mount B || fail "mount B"; echo "B online" > "$MM/mntB/fB"; mm_umount B "$MM_PID"
+check "conflicting mount is refused"     mm_refused A
+check "...with an explanation"           grep -q -e "--prefer-cloud" "$MM/refusal"
+mm_mount A --prefer-cloud || fail "mount A --prefer-cloud"
+check "--prefer-cloud takes B's changes" [ -e "$MM/mntA/fB" ]
+check "...and drops A's unsynced ones"   [ ! -e "$MM/mntA/fA" ]
+mm_umount A "$MM_PID"
+
+export ENCFS_STUB_FAIL=1
+mm_mount A || fail "mount A offline 2"; echo "A wins" > "$MM/mntA/fA2"; mm_umount A "$MM_PID"
+unset ENCFS_STUB_FAIL
+mm_mount B || fail "mount B 2"; echo "B loses" > "$MM/mntB/fB2"; mm_umount B "$MM_PID"
+mm_mount A --prefer-local || fail "mount A --prefer-local"
+check "--prefer-local keeps A's changes" [ "$(cat "$MM/mntA/fA2")" = "A wins" ]
+mm_umount A "$MM_PID"
+LIST=$(cloud_list)
+check "cloud index has A's file, not B's" bash -c "[[ \"$LIST\" == *fA2* && \"$LIST\" != *fB2* ]]"
+mm_mount B || fail "mount B after prefer-local"
+check "B follows the cloud"              [ "$(cat "$MM/mntB/fA2")" = "A wins" ]
+mm_umount B "$MM_PID"
+
+# Both mounted at once: whoever uploads second must not overwrite the first.
+mm_mount A || fail "mount A (concurrent)"; PID_A=$MM_PID
+mm_mount B || fail "mount B (concurrent)"; PID_B=$MM_PID
+echo "from B" > "$MM/mntB/fB3"; mm_umount B "$PID_B"
+echo "from A" > "$MM/mntA/fA3"
+for _ in $(seq 50); do grep -q "changed by another machine" "$LOG" && break; sleep 0.1; done
+check "A detects the concurrent change"  grep -q "changed by another machine" "$LOG"
+check_fails "A refuses further writes"   bash -c "echo more > '$MM/mntA/fA4'" 2>/dev/null
+mm_umount A "$PID_A"
+LIST=$(cloud_list)
+check "cloud kept B's index intact"      bash -c "[[ \"$LIST\" == *fB3* && \"$LIST\" != *fA3* ]]"
+check "A must then resolve the conflict" mm_refused A
+mm_mount A --prefer-cloud || fail "resolve A"; mm_umount A "$MM_PID"
+
+# Rollback: an old copy of the index put back in the cloud is refused.
+cp "$MM/cloud/index" "$MM/old_index"
+mm_mount B || fail "mount B (rollback)"; echo newer > "$MM/mntB/f_new"; mm_umount B "$MM_PID"
+cp "$MM/old_index" "$MM/cloud/index"
+check "rolled-back cloud index refused"  mm_refused B
+check "...with an explanation"           grep -q "rolled back" "$MM/refusal"
+mm_mount B --prefer-local || fail "repair rollback"
+check "--prefer-local restores it"       [ "$(cat "$MM/mntB/f_new")" = newer ]
+mm_umount B "$MM_PID"
+export ENCFS_STUB_STORE="$MAIN_STORE"
+
 # ── encfsctl: init, passphrase changes, status ──
 CTL_WORK="$WORK/ctl"; mkdir -p "$CTL_WORK"
 check "init creates a key file"            quiet "$CTL_BIN" init -k "$CTL_WORK/new.key" "$CTL_WORK/keyed"
@@ -467,6 +551,12 @@ check_fails "wrong passphrase rejected before any data exists" \
 pmount first || fail "mount with passphrase"
 echo "guarded by a passphrase" > "$MNT/p.txt"
 unmount_fs
+# Machine B restores the passphrase store before the passphrase changes.
+BACK_A="$BACK"; BACK="$CTL_WORK/pass_backing_B"
+pmount first || fail "mount B with passphrase"
+check "machine B restores the passphrase store" [ "$(cat "$MNT/p.txt")" = "guarded by a passphrase" ]
+unmount_fs
+BACK="$BACK_A"
 check "passwd changes the passphrase" \
     quiet env ENCFS_PASSPHRASE=first ENCFS_NEW_PASSPHRASE=second "$CTL_BIN" passwd -c "$STUB" "$BACK"
 check_fails "passwd needs the right current passphrase" \
@@ -477,6 +567,19 @@ pmount second || fail "mount with new passphrase"
 check "files intact under the new passphrase" [ "$(cat "$MNT/p.txt")" = "guarded by a passphrase" ]
 unmount_fs
 check "cloud got the new encfs.kdf"        cmp -s "$BACK/encfs.kdf" "$ENCFS_STUB_STORE/encfs.kdf"
+check "upload clears the pending marker"   [ ! -e "$BACK/encfs.kdf.pending" ]
+# B still has the old encfs.kdf: its next mount picks up the change instead
+# of reverting it, and from then on only the new passphrase works there.
+BACK="$CTL_WORK/pass_backing_B"
+pmount first || fail "mount B with its stale encfs.kdf"
+unmount_fs
+check "B adopted the new encfs.kdf"        grep -q "passphrase was changed on another machine" "$LOG"
+check "cloud kept the new encfs.kdf"       cmp -s "$BACK_A/encfs.kdf" "$ENCFS_STUB_STORE/encfs.kdf"
+check_fails "B now refuses the old passphrase" \
+    env ENCFS_PASSPHRASE=first "$FS_BIN" -p -c "$STUB" "$MNT" "$BACK" 2>/dev/null
+pmount second || fail "mount B with the new passphrase"
+unmount_fs
+BACK="$BACK_A"
 check "restore on a new machine with the new passphrase" \
     [ "$(ENCFS_PASSPHRASE=second "$DECRYPT_BIN" -p -c "$STUB" "$CTL_WORK/fresh" p.txt - 2>/dev/null)" = "guarded by a passphrase" ]
 STATUS=$(ENCFS_PASSPHRASE=second "$CTL_BIN" status -p "$BACK" 2>&1)

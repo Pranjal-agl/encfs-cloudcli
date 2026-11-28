@@ -75,6 +75,13 @@ public:
     // upload succeeds, with the remote ID that was uploaded.
     void SetUploadCallback(std::function<void(const std::string&)> callback);
 
+    // Optional check run on the worker thread (no internal lock held) just
+    // before an upload. It may replace the path to upload (e.g. with a stable
+    // snapshot). kRetry: try again later with back-off. kAbort: don't upload;
+    // keep the operation in the journal for the next mount.
+    enum class PreUpload { kProceed, kRetry, kAbort };
+    void SetPreUploadHook(std::function<PreUpload(const std::string& remote_id, std::string& path)> hook);
+
 private:
     struct Op {
         enum Kind { kUpload, kDelete } kind = kUpload;
@@ -97,6 +104,7 @@ private:
     bool in_flight_ = false;
     std::string in_flight_id_;
     std::function<void(const std::string&)> upload_callback_;
+    std::function<PreUpload(const std::string&, std::string&)> pre_upload_hook_;
     bool stop_ = false;
     std::thread worker_;
 
