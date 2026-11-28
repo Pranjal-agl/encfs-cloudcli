@@ -19,6 +19,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
 - **Constant memory, any file size** — reads decrypt only the chunks they touch, and writes keep only a few chunks in RAM. Copying in a 1 GB file peaks at 21 MB, where buffering it whole took about 2 GB.
 - **Concurrent** — FUSE runs multi-threaded with per-file locking, so a slow download of one file doesn't stall `ls`, other reads or other writes
+- **Several machines, one store** — each mount picks up changes made elsewhere. Conflicting changes are detected instead of silently overwritten, and so is a rolled-back cloud index.
 - **Bounded local cache** — with `--cache-size 20G` the backing directory becomes a cache. Blobs the cloud provably holds at their current version are evicted least-recently-used first, and nothing is evicted while an upload is pending.
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
@@ -198,6 +199,8 @@ encrypted_cloudfs [options] <mountpoint> <backing_dir> [-- <fuse options>]
   -p, --passphrase    derive the key from a passphrase ($ENCFS_PASSPHRASE, or prompt)
   -c, --cloudcli CMD  cloudcli executable (default: $ENCFS_CLOUDCLI or cloudcli)
   -b, --background    detach from the terminal once mounted
+      --prefer-cloud  on a conflict with another machine, take the cloud's index
+      --prefer-local  on a conflict, keep this machine's index and upload it
       --cache-size N  keep at most N of blobs locally (e.g. 500M, 20G); default: keep all
   -d, --debug         print FUSE debug output
 ```
@@ -217,6 +220,23 @@ If the backing directory already has an index, the key must be able to decrypt i
 - `passwd` uploads the new `encfs.kdf` straight away, and every mount uploads it again in case that failed.
 - Stores created before v2.10 used the passphrase to derive the master key directly (KDF v1). `passwd` upgrades them in place, around the same key.
 - Changing a passphrase doesn't change the master key. If an old passphrase leaked *and* someone kept an old `encfs.kdf`, they can still unlock the store. To fully re-key, `decrypt_by_name --extract-all` and copy the files into a new store.
+
+### Using several machines
+
+Point several machines at the same cloud store with the same key or passphrase, and each mount picks up what the others did. Every index save bumps a generation number, and each backing directory remembers, in `cloud.gen`, the cloud generation it last synced with. Comparing the three at mount:
+
+| Cloud index vs. last sync | This machine | Result |
+|---|---|---|
+| unchanged | anything | use the local copy |
+| newer | no unsynced changes | adopt the cloud's index; stale local blobs are re-downloaded |
+| newer | unsynced changes | **refuse**, until resolved with `--prefer-cloud` or `--prefer-local` |
+| older | anything | **refuse**: the cloud index was rolled back or replaced |
+
+The same check runs before every index upload. If two machines are mounted at once and one uploads, the other notices before it would overwrite that upload: it stops uploading, refuses further writes, and asks for a remount to resolve.
+
+Uploads are ordered so the index is always uploaded after the blobs it refers to. A passphrase changed on one machine (`encfsctl passwd`) reaches the others on their next mount, rather than being reverted by them.
+
+What this can't do: `cloudcli` offers only upload, download and delete, with no atomic compare-and-swap. A collision is therefore *detected* when it happens, but two machines can't both write the same store at the same moment and have their changes merged. Use one machine at a time, and let the checks catch mistakes.
 
 ### Limiting local disk use
 
@@ -284,7 +304,7 @@ CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan bu
 ## Limitations
 
 - **Each save rewrites the whole blob**: memory stays constant, but CPU and disk time are proportional to file size, and `cloudcli` uploads the whole blob. Small edits to very large files are therefore slow to sync.
-- **Single writer**: don't mount the same cloud store from two machines at once. Each machine's index would overwrite the other's.
+- **One writer at a time**: several machines can share a store, and conflicting changes are detected and refused, but not merged (see *Using several machines*).
 - **Ownership isn't stored**: everything belongs to the mounting user. Permission bits are stored and enforced (`default_permissions`). `chown` is accepted and ignored, so `rsync -a` and `cp -p` work.
 
 ### Upgrading from v1
@@ -301,6 +321,15 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v3.1 — several machines
+
+- **Index generations:** each backing directory tracks the cloud generation it last synced with, in `cloud.gen`. A mount adopts a newer cloud index, refuses a conflict until `--prefer-cloud` or `--prefer-local` resolves it, and refuses a rolled-back index.
+- **Check before every index upload:** a machine that finds the cloud changed underneath it, for example a second machine mounted at the same time, stops instead of overwriting.
+- **Upload ordering:** the index always goes after the blobs it references.
+- **`encfs.kdf` propagation:** a changed file carries a `.pending` marker until it's uploaded. Machines without a marker adopt the cloud's copy, so a passphrase change elsewhere isn't reverted.
+- `encfsctl status` shows the index generation and sync state.
+- e2e: hand-off between machines; offline conflict with `--prefer-cloud` and `--prefer-local`; two machines mounted at once; rollback; passphrase change propagation. The ThreadSanitizer run is clean.
 
 ### v3.0 — inodes
 

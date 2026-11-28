@@ -31,6 +31,7 @@
 #include "file_codec.h"
 #include "file_contents.h"
 #include "index.h"
+#include "index_sync.h"
 #include "key_setup.h"
 #include "util.h"
 
@@ -114,6 +115,14 @@ struct Context {
     // Set if that check found an existing cloud index: we refuse all writes
     // until the user remounts (and the index is restored).
     std::atomic<bool> read_only{false};
+
+    // Multi-machine bookkeeping (see index_sync.h). The master key is kept to
+    // read generations of index snapshots and cloud copies.
+    std::vector<uint8_t> master_key;
+    std::atomic<uint64_t> synced_gen{0};      // cloud generation we last synced with
+    std::atomic<bool> synced_gen_known{true};  // false: pre-3.1 store, learned at first check
+    std::atomic<uint64_t> uploading_gen{0};   // generation of the index snapshot in flight
+    std::atomic<bool> force_index_upload{false};  // --prefer-local over an unreadable cloud copy
 
     // Local cache limit for blobs (0 = keep everything). See EnforceCacheLimit.
     uint64_t cache_limit = 0;
@@ -618,7 +627,17 @@ void MaybeEnforceCacheLimit() {
 
 // Called by the sync worker after an upload finishes.
 void OnUploaded(const std::string& id) {
-    if (id.size() != 64) return;  // index / KDF objects
+    if (id == kCloudIndexId) {
+        g_ctx->synced_gen = g_ctx->uploading_gen.load();
+        g_ctx->synced_gen_known = true;
+        SaveSyncedGeneration(g_ctx->backing_dir, g_ctx->synced_gen);
+        return;
+    }
+    if (id == kCloudKdfId) {
+        ::unlink((g_ctx->backing_dir + "/encfs.kdf.pending").c_str());
+        return;
+    }
+    if (id.size() != 64) return;
     std::lock_guard<std::mutex> lock(g_ctx->mutex);
     FileMetadata meta;
     if (!g_ctx->index->GetInode(id, meta)) return;
@@ -627,6 +646,166 @@ void OnUploaded(const std::string& id) {
     MarkSynced(id, meta.version);
     EnforceCacheLimit();
     SaveSynced();
+}
+
+// Runs on the sync worker before each upload. For the index: snapshot it,
+// and check that the cloud copy is still the one we last synced with. If
+// another machine has uploaded since, stop: overwriting would lose its work.
+CloudCLIWrapper::PreUpload BeforeUpload(const std::string& id, std::string& path) {
+    using P = CloudCLIWrapper::PreUpload;
+    if (id != kCloudIndexId) return P::kProceed;
+
+    const std::string dir = g_ctx->backing_dir + "/.upload";
+    ::mkdir(dir.c_str(), 0700);
+    std::vector<uint8_t> bytes;
+    uint64_t snapshot_gen = 0;
+    if (!ReadWholeFile(g_ctx->index->path(), bytes) || !WriteFileAtomic(dir + "/index.enc", bytes) ||
+        !IndexFileGeneration(dir, g_ctx->master_key, &snapshot_gen)) {
+        return P::kRetry;
+    }
+
+    if (!g_ctx->force_index_upload.exchange(false)) {
+        uint64_t cloud_gen = 0;
+        bool conflict = false;
+        switch (FetchCloudIndex(*g_ctx->cloud, g_ctx->master_key, g_ctx->backing_dir, &cloud_gen)) {
+        case CloudIndexStatus::kUnavailable:
+            // Nothing there yet (new store) — or unreachable, in which case
+            // the upload fails too and is retried.
+            if (g_ctx->synced_gen_known && g_ctx->synced_gen == 0) break;
+            return P::kRetry;
+        case CloudIndexStatus::kUnreadable:
+            conflict = true;
+            break;
+        case CloudIndexStatus::kFound:
+            if (!g_ctx->synced_gen_known && cloud_gen <= snapshot_gen) {
+                g_ctx->synced_gen = cloud_gen;  // pre-3.1 store: learn the base now
+                g_ctx->synced_gen_known = true;
+            }
+            conflict = !g_ctx->synced_gen_known || cloud_gen != g_ctx->synced_gen;
+            break;
+        }
+        if (conflict) {
+            g_ctx->read_only = true;
+            Log("the cloud index was changed by another machine while this one was mounted. "
+                "Not uploading (that would overwrite its changes); writes are now disabled. "
+                "Unmount and mount again with --prefer-cloud or --prefer-local to resolve.");
+            return P::kAbort;
+        }
+    }
+    g_ctx->uploading_gen = snapshot_gen;
+    path = dir + "/index.enc";
+    return P::kProceed;
+}
+
+enum class Prefer { kNone, kCloud, kLocal };
+
+bool JournalHasWork(const std::string& backing_dir) {
+    struct stat st;
+    return ::stat((backing_dir + "/sync.journal").c_str(), &st) == 0 && st.st_size > 0;
+}
+
+// At mount, before anything is queued: bring the local index in line with the
+// cloud's (see index_sync.h). Returns 0, or an exit status to refuse the mount.
+int ReconcileIndexAtMount(Context& ctx, bool restored, bool fresh, Prefer prefer) {
+    const std::string& dir = ctx.backing_dir;
+    const uint64_t local = ctx.index->generation();
+    if (fresh) {
+        ctx.synced_gen = 0;  // the first save re-checks the cloud (index guard)
+        return 0;
+    }
+    if (restored) {
+        ctx.synced_gen = local;
+        SaveSyncedGeneration(dir, local);
+        return 0;
+    }
+
+    uint64_t base = 0;
+    bool have_base = LoadSyncedGeneration(dir, &base);
+    uint64_t cloud = 0;
+    const CloudIndexStatus status = FetchCloudIndex(*ctx.cloud, ctx.master_key, dir, &cloud);
+    const char* how = "\n  --prefer-cloud  use the cloud's index, discarding this machine's unsynced changes"
+                      "\n  --prefer-local  keep this machine's index and overwrite the cloud's\n";
+
+    if (status == CloudIndexStatus::kUnavailable) {
+        std::cerr << "[encfs] can't reach the cloud index; using the local copy (it is checked "
+                     "against the cloud again before anything is uploaded)\n";
+        ctx.synced_gen = base;
+        ctx.synced_gen_known = have_base;
+        return 0;
+    }
+    if (status == CloudIndexStatus::kUnreadable) {
+        if (prefer != Prefer::kLocal) {
+            std::cerr << "Error: the cloud's index can't be decrypted with this key (it was "
+                         "replaced, or is corrupt). Mount with --prefer-local to overwrite it "
+                         "with this machine's copy.\n";
+            return 1;
+        }
+        ctx.force_index_upload = true;
+        ctx.cloud->QueueUpload(ctx.index->path());
+        return 0;
+    }
+
+    if (!have_base) {
+        if (cloud <= local) {
+            base = cloud;  // a store from before multi-machine tracking:
+            have_base = true;  // single-machine history, the cloud just lags
+        } else if (prefer == Prefer::kNone) {
+            std::cerr << "Error: the cloud's index (generation " << cloud << ") is newer than this "
+                      << "machine's (" << local << "), and this backing directory predates change "
+                      << "tracking, so it can't tell whose changes are whose. Choose:" << how;
+            return 1;
+        }
+    }
+
+    const bool local_dirty = local != base || JournalHasWork(dir);
+    auto adopt = [&]() -> int {
+        if (local_dirty) {
+            std::cerr << "[encfs] discarding this machine's unsynced changes (--prefer-cloud)\n";
+            ::unlink((dir + "/sync.journal").c_str());
+        }
+        int dropped = AdoptFetchedCloudIndex(dir, *ctx.index, *ctx.codec);
+        if (dropped < 0) {
+            std::cerr << "Error: could not adopt the cloud's index\n";
+            return 1;
+        }
+        std::cerr << "[encfs] took the newer index from the cloud (generation " << cloud << ")";
+        if (dropped) std::cerr << "; " << dropped << " outdated local blob(s) will be re-downloaded";
+        std::cerr << "\n";
+        ctx.synced_gen = cloud;
+        SaveSyncedGeneration(dir, cloud);
+        return 0;
+    };
+    auto keep_local = [&]() -> bool {
+        // The copy we upload must be newer than anything the cloud has seen,
+        // or other machines would take it for a rollback. Save bumps it.
+        ctx.index->set_generation(std::max(local, cloud));
+        if (!ctx.index->Save()) return false;
+        ctx.synced_gen = cloud;
+        SaveSyncedGeneration(dir, cloud);
+        ctx.cloud->QueueUpload(ctx.index->path());
+        std::cerr << "[encfs] keeping this machine's index; it will replace the cloud's (--prefer-local)\n";
+        return true;
+    };
+
+    if (cloud == base && have_base) {
+        ctx.synced_gen = base;
+        return 0;
+    }
+    if (cloud > base || !have_base) {
+        if (!local_dirty || prefer == Prefer::kCloud) return adopt();
+        if (prefer == Prefer::kLocal) return keep_local() ? 0 : 1;
+        std::cerr << "Error: conflict. Another machine changed the store (cloud generation " << cloud
+                  << ") and this machine also has unsynced changes (generation " << local
+                  << ", last synced " << base << "). Choose:" << how;
+        return 1;
+    }
+    // cloud < base: the cloud's index went backwards.
+    if (prefer == Prefer::kCloud) return adopt();
+    if (prefer == Prefer::kLocal) return keep_local() ? 0 : 1;
+    std::cerr << "Error: the cloud's index (generation " << cloud << ") is older than the one this "
+              << "machine last synced (" << base << "): it may have been rolled back or replaced "
+              << "with an old copy. Choose:" << how;
+    return 1;
 }
 
 // At mount: upload any local blob the cloud isn't known to have at its
@@ -1334,6 +1513,8 @@ void PrintUsage(const char* prog) {
         "                      ($ENCFS_PASSPHRASE, or prompt)\n"
         "  -c, --cloudcli CMD  cloudcli executable (default: $ENCFS_CLOUDCLI or cloudcli)\n"
         "  -b, --background    detach from the terminal once mounted\n"
+        "      --prefer-cloud  on a conflict with another machine, take the cloud's index\n"
+        "      --prefer-local  on a conflict, keep this machine's index and upload it\n"
         "      --cache-size N  keep at most N of encrypted blobs locally (e.g. 500M, 20G);\n"
         "                      older ones the cloud already has are removed and\n"
         "                      downloaded again when needed (default: keep everything)\n"
@@ -1350,6 +1531,7 @@ int main(int argc, char* argv[]) {
     KeyOptions key_options;
     std::string cloudcli_cmd = CloudCLIWrapper::DefaultCommand();
     bool background = false;
+    Prefer prefer = Prefer::kNone;
     uint64_t cache_limit = 0;
     bool debug = false;
 
@@ -1359,6 +1541,8 @@ int main(int argc, char* argv[]) {
         {"cloudcli", required_argument, nullptr, 'c'},
         {"background", no_argument, nullptr, 'b'},
         {"cache-size", required_argument, nullptr, 'S'},
+        {"prefer-cloud", no_argument, nullptr, 'C'},
+        {"prefer-local", no_argument, nullptr, 'L'},
         {"debug", no_argument, nullptr, 'd'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, nullptr, 'V'},
@@ -1371,6 +1555,8 @@ int main(int argc, char* argv[]) {
         case 'p': key_options.use_passphrase = true; break;
         case 'c': cloudcli_cmd = optarg; break;
         case 'b': background = true; break;
+        case 'C': prefer = Prefer::kCloud; break;
+        case 'L': prefer = Prefer::kLocal; break;
         case 'S':
             cache_limit = ParseSize(optarg);
             if (cache_limit == UINT64_MAX) {
@@ -1419,8 +1605,10 @@ int main(int argc, char* argv[]) {
     const std::string index_path = backing_dir + "/index.enc";
     const std::string kdf_path = backing_dir + "/encfs.kdf";
     bool fresh_index = false;
+    bool restored_index = false;
     if (!LocalFileExists(index_path)) {
         if (FetchFromCloud(bootstrap, kCloudIndexId, index_path)) {
+            restored_index = true;
             std::cerr << "[encfs] restored the index from the cloud\n";
         } else {
             fresh_index = true;
@@ -1447,6 +1635,7 @@ int main(int argc, char* argv[]) {
     ctx->uid = getuid();
     ctx->gid = getgid();
     ctx->mount_time = Now();
+    ctx->master_key = master_key;
     SecureWipe(master_key);
 
     if (!ctx->index->Load()) {
@@ -1457,20 +1646,34 @@ int main(int argc, char* argv[]) {
 
     ctx->index_guard_pending = fresh_index;
     ctx->cache_limit = cache_limit;
+    if (int rc = ReconcileIndexAtMount(*ctx, restored_index, fresh_index, prefer)) return rc;
+
+    // Passphrase stores: a changed encfs.kdf travels with a ".pending" marker
+    // from the machine that changed it. Without one, the cloud's copy wins, so
+    // a passphrase changed elsewhere isn't reverted from here.
+    const bool kdf_pending = LocalFileExists(kdf_path + ".pending");
+    if (key_options.use_passphrase && !kdf_pending && !restored_index) {
+        const std::string theirs = kdf_path + ".cloud";
+        std::vector<uint8_t> a, b;
+        if (FetchFromCloud(bootstrap, kCloudKdfId, theirs) && ReadWholeFile(theirs, a) &&
+            ReadWholeFile(kdf_path, b) && a != b && ::rename(theirs.c_str(), kdf_path.c_str()) == 0) {
+            std::cerr << "[encfs] the passphrase was changed on another machine; "
+                         "use the new one from now on\n";
+        }
+        ::unlink(theirs.c_str());
+    }
+
     ctx->cloud->SetJournalPath(backing_dir + "/sync.journal");
     if (size_t resumed = ctx->cloud->RecoverJournal()) {
         std::cerr << "[encfs] resuming " << resumed << " unfinished cloud operation(s)\n";
     }
-    if (key_options.use_passphrase && LocalFileExists(kdf_path)) {
-        // Keep the cloud copy current (new store, `encfsctl passwd`, or an
-        // earlier upload that failed). It's tiny.
-        ctx->cloud->QueueUpload(kdf_path);
-    }
+    if (kdf_pending) ctx->cloud->QueueUpload(kdf_path);
     g_ctx = ctx.get();
+    ctx->cloud->SetPreUploadHook(BeforeUpload);
+    ctx->cloud->SetUploadCallback(OnUploaded);
     if (cache_limit > 0) {
         LoadSynced();
         ReconcileWithCloud();
-        ctx->cloud->SetUploadCallback(OnUploaded);
         std::lock_guard<std::mutex> lock(ctx->mutex);
         EnforceCacheLimit();
     }

@@ -58,6 +58,9 @@ bool UnlockPassphraseStore(const std::string& backing_dir, const std::string& pa
                            std::vector<uint8_t>& master, std::string& error,
                            int* kdf_version = nullptr);
 
+// Creating or re-wrapping encfs.kdf also writes encfs.kdf.pending: the file
+// changed here and must be uploaded. Whoever uploads it removes the marker.
+
 // Replace encfs.kdf with a v2 file wrapping `master` under `new_passphrase`.
 bool RewrapPassphraseStore(const std::string& backing_dir, const std::vector<uint8_t>& master,
                            const std::string& new_passphrase, std::string& error);

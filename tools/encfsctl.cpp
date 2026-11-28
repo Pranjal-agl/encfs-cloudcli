@@ -7,6 +7,7 @@
 #include "cloudcli_wrapper.h"
 #include "crypto.h"
 #include "index.h"
+#include "index_sync.h"
 #include "key_setup.h"
 #include "util.h"
 
@@ -145,6 +146,7 @@ int Passwd(const std::string& cloudcli_cmd, const std::string& backing_dir) {
 
     std::cout << "Passphrase changed" << (version == 1 ? " (and encfs.kdf upgraded to v2)" : "") << ".\n";
     if (cloud.Upload(kdf_path)) {
+        ::unlink((kdf_path + ".pending").c_str());
         std::cout << "Uploaded the new encfs.kdf to the cloud.\n";
     } else {
         std::cout << "Warning: could not upload encfs.kdf; the cloud still has the old one.\n"
@@ -207,6 +209,18 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
               << (cached < files ? " (the rest are fetched from the cloud when opened)" : "") << "\n"
               << "Pending sync:   " << pending << " operation(s)"
               << (pending ? " (finished on the next mount)" : "") << "\n";
+    {
+        uint64_t base = 0;
+        const bool known = LoadSyncedGeneration(backing_dir, &base);
+        const uint64_t local = index.generation();
+        std::cout << "Index:          generation " << local;
+        if (known) {
+            std::cout << (local == base ? ", in sync with the cloud"
+                                        : ", last synced with the cloud at " + std::to_string(base) +
+                                              " (unsynced changes)");
+        }
+        std::cout << "\n";
+    }
     if (has_synced) {
         std::cout << "Confirmed:      " << count_lines(backing_dir + "/synced.list")
                   << " blob(s) known to be in the cloud at their current version\n";

@@ -144,14 +144,26 @@ void CloudCLIWrapper::WorkerLoop() {
         // Find the first queued ID whose back-off has elapsed.
         auto now = Clock::now();
         auto earliest = Clock::time_point::max();
+        // The index goes last: it must never reach the cloud before the
+        // blobs it refers to.
         auto ready = order_.end();
+        auto ready_index = order_.end();
         for (auto it = order_.begin(); it != order_.end(); ++it) {
             auto p = pending_.find(*it);
             if (p == pending_.end() || p->second.not_before <= now) {
-                ready = it;
-                break;
+                if (*it != "index") {
+                    ready = it;
+                    break;
+                }
+                if (ready_index == order_.end()) ready_index = it;
+                continue;
             }
             earliest = std::min(earliest, p->second.not_before);
+        }
+        if (ready == order_.end()) {
+            bool others_waiting = false;
+            for (const auto& id : order_) others_waiting |= (id != "index");
+            if (!others_waiting) ready = ready_index;
         }
 
         if (ready == order_.end()) {
@@ -176,8 +188,12 @@ void CloudCLIWrapper::WorkerLoop() {
         in_flight_id_ = remote_id;
         failed_[remote_id] = op;  // keeps it in the journal while in flight
         auto callback = upload_callback_;
+        auto hook = pre_upload_hook_;
         lock.unlock();
-        bool ok = Run(op, remote_id);
+        PreUpload verdict = PreUpload::kProceed;
+        Op run_op = op;
+        if (op.kind == Op::kUpload && hook) verdict = hook(remote_id, run_op.local_path);
+        bool ok = verdict == PreUpload::kProceed && Run(run_op, remote_id);
         lock.lock();
         in_flight_ = false;
         in_flight_id_.clear();
@@ -190,7 +206,11 @@ void CloudCLIWrapper::WorkerLoop() {
             lock.lock();
         }
 
-        if (!ok && pending_.count(remote_id) == 0) {
+        if (verdict == PreUpload::kAbort) {
+            // Vetoed (e.g. a conflicting index in the cloud): no retries this
+            // session, but keep it in the journal.
+            if (pending_.count(remote_id) == 0) failed_[remote_id] = op;
+        } else if (!ok && pending_.count(remote_id) == 0) {
             // Not superseded by a newer op — retry, or give up for this session.
             op.attempts++;
             const char* what = op.kind == Op::kUpload ? "upload" : "delete";
@@ -240,6 +260,12 @@ bool CloudCLIWrapper::IsPending(const std::string& remote_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     return pending_.count(remote_id) > 0 || failed_.count(remote_id) > 0 ||
            (in_flight_ && in_flight_id_ == remote_id);
+}
+
+void CloudCLIWrapper::SetPreUploadHook(
+    std::function<PreUpload(const std::string&, std::string&)> hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pre_upload_hook_ = std::move(hook);
 }
 
 void CloudCLIWrapper::SetUploadCallback(std::function<void(const std::string&)> callback) {

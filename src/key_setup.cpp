@@ -94,6 +94,9 @@ bool WriteWrappedKdf(const std::string& path, const std::vector<uint8_t>& master
         error = "cannot write " + path + ": " + std::strerror(errno);
         return false;
     }
+    // Changed here: mark it for upload (cleared once the cloud has it), so
+    // other machines pick up the change rather than this one reverting it.
+    WriteFileAtomic(path + ".pending", nullptr, 0, 0600);
     return true;
 }
 
