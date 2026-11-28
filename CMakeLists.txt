@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(encfs-cloudcli VERSION 3.1.0 LANGUAGES CXX)
+project(encfs-cloudcli VERSION 3.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,6 +55,7 @@ add_library(encfs_core STATIC
     src/file_codec.cpp
     src/file_contents.cpp
     src/index_sync.cpp
+    src/segments.cpp
     src/key_setup.cpp
     src/cloudcli_wrapper.cpp
 )
@@ -87,6 +88,10 @@ add_executable(test_contents tests/unit/test_contents.cpp)
 target_link_libraries(test_contents PRIVATE encfs_core)
 add_test(NAME test_contents COMMAND test_contents)
 
+add_executable(test_segments tests/unit/test_segments.cpp)
+target_link_libraries(test_segments PRIVATE encfs_core)
+add_test(NAME test_segments COMMAND test_segments)
+
 add_executable(test_integration tests/integration/test_integration.cpp)
 target_link_libraries(test_integration PRIVATE encfs_core)
 target_compile_definitions(test_integration PRIVATE
@@ -113,7 +118,7 @@ set_tests_properties(test_web_crosscheck PROPERTIES SKIP_RETURN_CODE 77)
 # Fuzz targets. Each is also registered as a short ctest run over its seed
 # corpus; run longer with e.g. build/fuzz_blob -max_total_time=600 corpus/
 if(ENCFS_FUZZ)
-    foreach(target blob index contents journal)
+    foreach(target blob index contents journal segments)
         add_executable(fuzz_${target} tests/fuzz/fuzz_${target}.cpp)
         target_link_libraries(fuzz_${target} PRIVATE encfs_core)
         target_link_options(fuzz_${target} PRIVATE -fsanitize=fuzzer)

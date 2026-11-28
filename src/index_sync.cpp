@@ -3,6 +3,7 @@
 #include "crypto.h"
 #include "file_codec.h"
 #include "index.h"
+#include "segments.h"
 #include "util.h"
 
 #include <cerrno>
@@ -16,10 +17,6 @@ namespace encfs {
 namespace {
 std::string FetchDir(const std::string& backing_dir) { return backing_dir + "/.cloud-index"; }
 
-bool IsBlobName(const std::string& n) {
-    return n.size() == 68 && n.compare(64, 4, ".enc") == 0 &&
-           n.find_first_not_of("0123456789abcdef") == 64;
-}
 } // namespace
 
 std::string FetchedCloudIndexPath(const std::string& backing_dir) {
@@ -74,21 +71,22 @@ int AdoptFetchedCloudIndex(const std::string& backing_dir, EncryptedIndex& index
     // check. Keep only exact matches.
     int removed = 0;
     if (DIR* d = ::opendir(backing_dir.c_str())) {
-        std::vector<std::string> names;
+        std::vector<std::string> ids;
         while (struct dirent* e = ::readdir(d)) {
-            if (IsBlobName(e->d_name)) names.emplace_back(e->d_name);
+            std::string id;
+            if (IsObjectFileName(e->d_name, &id)) ids.push_back(id);
         }
         ::closedir(d);
-        for (const auto& n : names) {
-            const std::string id = n.substr(0, 64);
-            const std::string path = backing_dir + "/" + n;
-            FileMetadata meta;
-            bool keep = false;
-            if (index.GetInode(id, meta) && meta.IsFile()) {
+        for (const auto& id : ids) {
+            const std::string path = backing_dir + "/" + id + ".enc";
+            bool keep = IndexReferencesObject(index, id);
+            if (keep && id.size() == 64) {
+                // A legacy whole-file blob: its name doesn't say its version.
+                FileMetadata meta;
                 std::unique_ptr<ChunkedReader> reader;
                 uint64_t actual = 0;
-                keep = codec.OpenReader(path, id, meta.version, &reader, &actual) ==
-                           FileCodec::Result::kOk &&
+                keep = index.GetInode(id, meta) &&
+                       codec.OpenReader(path, id, meta.version, &reader, &actual) == FileCodec::Result::kOk &&
                        reader && actual == meta.version;
             }
             if (!keep && ::unlink(path.c_str()) == 0) ++removed;

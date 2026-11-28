@@ -32,6 +32,7 @@
 #include "file_contents.h"
 #include "index.h"
 #include "index_sync.h"
+#include "segments.h"
 #include "key_setup.h"
 #include "util.h"
 
@@ -123,6 +124,7 @@ struct Context {
     std::atomic<bool> synced_gen_known{true};  // false: pre-3.1 store, learned at first check
     std::atomic<uint64_t> uploading_gen{0};   // generation of the index snapshot in flight
     std::atomic<bool> force_index_upload{false};  // --prefer-local over an unreadable cloud copy
+    bool pad = false;  // --pad: round final segments up to hide exact sizes
 
     // Local cache limit for blobs (0 = keep everything). See EnforceCacheLimit.
     uint64_t cache_limit = 0;
@@ -231,9 +233,50 @@ int DecryptBlob(const std::string& name, FileMetadata meta,
     }
 }
 
-std::unique_ptr<FileContents> NewContents(std::unique_ptr<ChunkedReader> base) {
+std::unique_ptr<FileContents> NewContents(std::unique_ptr<ChunkSource> base) {
     size_t chunk = base ? base->chunk_size() : g_ctx->codec->chunk_size();
     return std::make_unique<FileContents>(std::move(base), chunk, g_ctx->backing_dir);
+}
+
+// Opens segment `seg` of a segmented file for SegmentedReader: from the local
+// cache, or downloaded (and verified before it is kept). Runs under the
+// file's lock, so only this file waits for a download.
+SegmentedReader::Opener SegmentOpener(const FileMetadata& meta) {
+    return [meta](uint64_t seg) -> std::unique_ptr<ChunkedReader> {
+        const uint64_t version = meta.segments[seg];
+        const std::string object = SegmentObjectId(meta.remote_id, seg, version);
+        const std::string path = BlobPath(object);
+        std::unique_ptr<ChunkedReader> reader;
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0) {
+            if (g_ctx->codec->OpenSegmentReader(path, meta.remote_id, seg, version, &reader) ==
+                FileCodec::Result::kOk) {
+                TouchBlob(path);
+                return reader;
+            }
+            Log("segment " + object + " failed authentication (corrupt, tampered, or misplaced)");
+            return nullptr;
+        }
+        const std::string tmp = path + ".download";
+        if (!g_ctx->cloud->Download(object, tmp)) {
+            ::unlink(tmp.c_str());
+            Log("segment " + object + " is not cached locally and could not be downloaded");
+            return nullptr;
+        }
+        if (g_ctx->codec->OpenSegmentReader(tmp, meta.remote_id, seg, version, &reader) !=
+            FileCodec::Result::kOk) {
+            ::unlink(tmp.c_str());
+            Log("downloaded segment " + object + " failed authentication");
+            return nullptr;
+        }
+        if (::rename(tmp.c_str(), path.c_str()) == 0) {
+            MarkSynced(object, version);  // the cloud verifiably holds it
+            g_ctx->cache_check_pending = true;
+        } else {
+            ::unlink(tmp.c_str());
+        }
+        return reader;  // the open descriptor survives the rename
+    };
 }
 
 // Publish size/state for getattr, which reads them without the file lock.
@@ -250,6 +293,15 @@ int OpenContents(OpenFile& file) {
     if (file.contents) return 0;
     FileMetadata meta;
     if (!g_ctx->index->GetInode(file.remote_id, meta)) return -ENOENT;
+
+    if (meta.segment_size > 0) {
+        // Segments are opened (and downloaded) only as they're read.
+        file.contents = std::make_unique<FileContents>(
+            std::make_unique<SegmentedReader>(meta, meta.chunk_size, SegmentOpener(meta)),
+            meta.chunk_size, g_ctx->backing_dir);
+        Publish(file);
+        return 0;
+    }
 
     const std::string path = BlobPath(meta.remote_id);
     std::string source = path;
@@ -366,60 +418,115 @@ void ReleaseRef(const std::shared_ptr<OpenFile>& file) {
     Publish(*file);
 }
 
-// Encrypt and write back a dirty file (streaming, chunk by chunk), update the
-// index, and queue the upload. Caller holds file.mu (only).
+// Save a dirty file. Files are stored as segments; only segments whose
+// contents or length changed are re-encrypted and uploaded, as new objects
+// (new version → new name). The index then switches to them in one atomic
+// save; superseded objects are deleted locally at once and in the cloud only
+// after the new index is there. A crash before the index save leaves the old
+// version intact (the new objects are unreferenced and cleaned up at mount).
+// Caller holds file.mu (only).
 int Persist(OpenFile& file) {
     if (!file.dirty || file.deleted) return 0;
     if (g_ctx->read_only) return -EROFS;
     if (int rc = OpenContents(file)) return rc;
 
-    FileMetadata meta;
-    if (!g_ctx->index->GetInode(file.remote_id, meta)) return 0;  // removed meanwhile
+    FileMetadata old_meta;
+    if (!g_ctx->index->GetInode(file.remote_id, old_meta)) return 0;  // removed meanwhile
 
-    const uint64_t version = meta.version + 1;
-    const std::string path = BlobPath(file.remote_id);
-    Unsync(file.remote_id);  // the cloud is about to be behind
-    AtomicFile out(path, 0600);
-    bool ok = out.Open();
-    if (ok) {
-        auto writer = g_ctx->codec->NewWriter(
-            [&out](const uint8_t* d, size_t n) { return out.Write(d, n); },
-            file.remote_id, version, file.contents->chunk_size());
-        ok = file.contents->ForEachChunk([&](const uint8_t* d, size_t n, bool last) {
-                 return writer->Add(d, n, last);
-             }) &&
-             writer->finished() && out.Commit();
+    FileContents& contents = *file.contents;
+    const size_t cs = contents.chunk_size();
+    const uint64_t seg_size =
+        (old_meta.segment_size > 0 && old_meta.chunk_size == cs) ? old_meta.segment_size : DefaultSegmentSize(cs);
+    const uint64_t chunks_per_segment = seg_size / cs;
+    const uint64_t size = contents.size();
+    const uint64_t count = std::max<uint64_t>(1, (size + seg_size - 1) / seg_size);
+    const uint64_t version = old_meta.version + 1;
+
+    // Which segments need writing?
+    const bool same_layout = old_meta.segment_size == seg_size && old_meta.chunk_size == cs;
+    std::vector<bool> dirty(count, !same_layout);
+    for (uint64_t i = 0; i < count; ++i) {
+        if (i >= old_meta.segments.size()) dirty[i] = true;
     }
-    if (!ok) {
-        int err = errno ? errno : EIO;
-        Log("'" + file.name + "': cannot write " + path + ": " + std::strerror(err));
-        return -err;
+    for (uint64_t chunk : contents.touched_chunks()) {
+        if (chunk / chunks_per_segment < count) dirty[chunk / chunks_per_segment] = true;
+    }
+    if (size != contents.base_size()) {
+        // Every segment from the one holding the shorter end onwards changes length.
+        for (uint64_t i = std::min(size, contents.base_size()) / seg_size; i < count; ++i) dirty[i] = true;
     }
 
-    // Read from the new blob from now on; the old one is gone.
-    std::unique_ptr<ChunkedReader> reader;
-    uint64_t actual = 0;
-    if (g_ctx->codec->OpenReader(path, file.remote_id, version, &reader, &actual) !=
-            FileCodec::Result::kOk || !reader) {
-        Log("'" + file.name + "': just-written blob does not verify");
-        return -EIO;
+    FileMetadata meta = old_meta;
+    meta.segment_size = static_cast<uint32_t>(seg_size);
+    meta.chunk_size = static_cast<uint32_t>(cs);
+    meta.segments.assign(count, version);
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!dirty[i]) meta.segments[i] = old_meta.segments[i];
     }
-    file.contents->Rebase(std::move(reader));
-
-    meta.remote_id = file.remote_id;
     meta.version = version;
-    meta.size = file.contents->size();
+    meta.size = size;
     meta.mtime = file.mtime.load();
+
+    // Write the changed segments as new objects.
+    std::vector<std::string> written;
+    std::vector<uint8_t> chunk;
+    auto abandon = [&](const std::string& what) {
+        int err = errno ? errno : EIO;
+        for (const auto& id : written) ::unlink(BlobPath(id).c_str());
+        Log("'" + file.name + "': " + what + ": " + std::strerror(err));
+        return -err;
+    };
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!dirty[i]) continue;
+        const std::string object = SegmentObjectId(file.remote_id, i, version);
+        const uint64_t start = i * seg_size;
+        const uint64_t length = size > start ? std::min(seg_size, size - start) : 0;
+        const uint64_t stored = (g_ctx->pad && i + 1 == count) ? PaddedLength(length, seg_size) : length;
+        const uint64_t n_chunks = std::max<uint64_t>(1, (stored + cs - 1) / cs);
+
+        AtomicFile out(BlobPath(object), 0600);
+        if (!out.Open()) return abandon("cannot create segment");
+        auto writer = g_ctx->codec->NewSegmentWriter(
+            [&out](const uint8_t* d, size_t n) { return out.Write(d, n); }, file.remote_id, i, version, cs);
+        bool ok = true;
+        for (uint64_t k = 0; k < n_chunks && ok; ++k) {
+            const uint64_t offset = k * cs;
+            const size_t len = static_cast<size_t>(std::min<uint64_t>(cs, stored - std::min(stored, offset)));
+            if (offset < length) {
+                // A base chunk that fails authentication stops the save:
+                // tampered data is never re-sealed as genuine.
+                ok = contents.LoadChunk(i * chunks_per_segment + k, chunk);
+            } else {
+                chunk.assign(cs, 0);  // padding
+            }
+            ok = ok && writer->Add(chunk.data(), len, k + 1 == n_chunks);
+        }
+        SecureWipe(chunk);
+        if (!ok || !writer->finished() || !out.Commit()) return abandon("cannot write segment " + object);
+        written.push_back(object);
+    }
+
+    // Commit: one index save switches the file to the new segments.
     g_ctx->index->UpdateInode(meta);
     if (int rc = SaveIndex()) {
-        // The blob is now one version ahead of the saved index; reads accept
-        // and repair that.
+        g_ctx->index->UpdateInode(old_meta);
+        for (const auto& id : written) ::unlink(BlobPath(id).c_str());
         return rc;
     }
 
+    // Read from the new layout from now on.
+    contents.Rebase(std::make_unique<SegmentedReader>(meta, cs, SegmentOpener(meta)));
     file.dirty = false;
     Publish(file);
-    g_ctx->cloud->QueueUpload(path);
+
+    for (const auto& id : written) g_ctx->cloud->QueueUpload(BlobPath(id));
+    const std::vector<std::string> now_ids = ObjectIds(meta);
+    for (const auto& id : ObjectIds(old_meta)) {
+        if (std::find(now_ids.begin(), now_ids.end(), id) != now_ids.end()) continue;
+        Unsync(id);
+        ::unlink(BlobPath(id).c_str());
+        g_ctx->cloud->QueueDelete(id);  // runs only after the new index is uploaded
+    }
     g_ctx->cache_check_pending = true;
     return 0;
 }
@@ -444,10 +551,10 @@ void RemovePath(const std::string& name) {
         }
     }
     SaveIndex();
-    if (removed.IsFile()) {
-        Unsync(removed.remote_id);
-        ::unlink(BlobPath(removed.remote_id).c_str());
-        g_ctx->cloud->QueueDelete(removed.remote_id);
+    for (const auto& id : ObjectIds(removed)) {
+        Unsync(id);
+        ::unlink(BlobPath(id).c_str());
+        g_ctx->cloud->QueueDelete(id);
     }
 }
 
@@ -524,8 +631,10 @@ void LoadSynced() {
         size_t nl = text.find('\n', pos);
         std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
         pos = nl == std::string::npos ? text.size() : nl + 1;
-        auto sp = line.find(' ');
-        if (sp == 64) g_ctx->synced[line.substr(0, 64)] = std::strtoull(line.c_str() + 65, nullptr, 10);
+        auto sp = line.rfind(' ');
+        if (sp != std::string::npos && sp >= 64) {
+            g_ctx->synced[line.substr(0, sp)] = std::strtoull(line.c_str() + sp + 1, nullptr, 10);
+        }
     }
 }
 
@@ -562,10 +671,20 @@ void TouchBlob(const std::string& path) {
     ::utimensat(AT_FDCWD, path.c_str(), times, 0);
 }
 
-bool IsBlobName(const std::string& n) {
-    return n.size() == 68 && n.compare(64, 4, ".enc") == 0 &&
-           n.find_first_not_of("0123456789abcdef") == 64;
+// The version the index currently expects of stored object `id` (segment
+// objects carry it in their name). False if the index no longer refers to it.
+bool CurrentObjectVersion(const std::string& id, uint64_t* version) {
+    if (!IndexReferencesObject(*g_ctx->index, id)) return false;
+    std::string inode;
+    uint64_t seg = 0;
+    if (ParseSegmentObjectId(id, &inode, &seg, version)) return true;
+    FileMetadata meta;
+    if (!g_ctx->index->GetInode(id, meta)) return false;
+    *version = meta.version;  // legacy whole-file blob
+    return true;
 }
+
+std::string InodeOfObject(const std::string& id) { return id.substr(0, 64); }
 
 bool SyncedVersion(const std::string& id, uint64_t* version) {
     std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
@@ -585,12 +704,12 @@ void EnforceCacheLimit() {
     uint64_t total = 0;
     if (DIR* d = ::opendir(g_ctx->backing_dir.c_str())) {
         while (struct dirent* e = ::readdir(d)) {
-            std::string n = e->d_name;
-            if (!IsBlobName(n)) continue;
+            std::string id;
+            if (!IsObjectFileName(e->d_name, &id)) continue;
             struct stat st;
-            if (::stat((g_ctx->backing_dir + "/" + n).c_str(), &st) != 0) continue;
+            if (::stat(BlobPath(id).c_str(), &st) != 0) continue;
             total += static_cast<uint64_t>(st.st_size);
-            blobs.push_back({n.substr(0, 64), static_cast<uint64_t>(st.st_size), st.st_atim});
+            blobs.push_back({id, static_cast<uint64_t>(st.st_size), st.st_atim});
         }
         ::closedir(d);
     }
@@ -605,10 +724,9 @@ void EnforceCacheLimit() {
     });
     for (const auto& blob : blobs) {
         if (total <= g_ctx->cache_limit) break;
-        FileMetadata meta;
-        uint64_t synced_version = 0;
-        if (!SyncedVersion(blob.id, &synced_version) || open_ids.count(blob.id) ||
-            !g_ctx->index->GetInode(blob.id, meta) || meta.version != synced_version ||
+        uint64_t synced_version = 0, current = 0;
+        if (!SyncedVersion(blob.id, &synced_version) || open_ids.count(InodeOfObject(blob.id)) ||
+            !CurrentObjectVersion(blob.id, &current) || current != synced_version ||
             g_ctx->cloud->IsPending(blob.id)) {
             continue;  // not provably safe in the cloud
         }
@@ -637,13 +755,12 @@ void OnUploaded(const std::string& id) {
         ::unlink((g_ctx->backing_dir + "/encfs.kdf.pending").c_str());
         return;
     }
-    if (id.size() != 64) return;
     std::lock_guard<std::mutex> lock(g_ctx->mutex);
-    FileMetadata meta;
-    if (!g_ctx->index->GetInode(id, meta)) return;
+    uint64_t version = 0;
+    if (!CurrentObjectVersion(id, &version)) return;
     // If another save is already queued, the cloud may still lag behind.
     if (g_ctx->cloud->IsPending(id)) return;
-    MarkSynced(id, meta.version);
+    MarkSynced(id, version);
     EnforceCacheLimit();
     SaveSynced();
 }
@@ -813,14 +930,16 @@ int ReconcileIndexAtMount(Context& ctx, bool restored, bool fresh, Prefer prefer
 void ReconcileWithCloud() {
     std::unordered_set<std::string> live;
     for (const FileMetadata& meta : g_ctx->index->AllInodes()) {
-        if (!meta.IsFile()) continue;
-        live.insert(meta.remote_id);
-        uint64_t synced_version = 0;
-        const std::string path = BlobPath(meta.remote_id);
-        struct stat st;
-        if ((!SyncedVersion(meta.remote_id, &synced_version) || synced_version != meta.version) &&
-            ::stat(path.c_str(), &st) == 0 && !g_ctx->cloud->IsPending(meta.remote_id)) {
-            g_ctx->cloud->QueueUpload(path);
+        for (const auto& id : ObjectIds(meta)) {
+            live.insert(id);
+            uint64_t synced_version = 0, current = 0;
+            const std::string path = BlobPath(id);
+            struct stat st;
+            if (CurrentObjectVersion(id, &current) &&
+                (!SyncedVersion(id, &synced_version) || synced_version != current) &&
+                ::stat(path.c_str(), &st) == 0 && !g_ctx->cloud->IsPending(id)) {
+                g_ctx->cloud->QueueUpload(path);
+            }
         }
     }
     std::lock_guard<std::mutex> lock(g_ctx->synced_mutex);
@@ -832,6 +951,28 @@ void ReconcileWithCloud() {
             ++it;
         }
     }
+}
+
+// At mount: remove what a crash can leave behind in the backing directory:
+// temp files, and objects the index no longer refers to (e.g. segments
+// written by a save that never committed). Never touches referenced objects.
+void CleanBackingDir() {
+    std::vector<std::string> doomed;
+    if (DIR* d = ::opendir(g_ctx->backing_dir.c_str())) {
+        while (struct dirent* e = ::readdir(d)) {
+            const std::string n = e->d_name;
+            std::string id;
+            if (IsObjectFileName(n, &id)) {
+                if (!IndexReferencesObject(*g_ctx->index, id)) doomed.push_back(n);
+            } else if (n.find(".enc.tmp.") != std::string::npos ||
+                       (n.size() > 9 && n.compare(n.size() - 9, 9, ".download") == 0)) {
+                doomed.push_back(n);
+            }
+        }
+        ::closedir(d);
+    }
+    for (const auto& n : doomed) ::unlink((g_ctx->backing_dir + "/" + n).c_str());
+    if (!doomed.empty()) Log("removed " + std::to_string(doomed.size()) + " leftover file(s) from the backing directory");
 }
 
 uint64_t ParseSize(const std::string& text) {
@@ -1515,6 +1656,8 @@ void PrintUsage(const char* prog) {
         "  -b, --background    detach from the terminal once mounted\n"
         "      --prefer-cloud  on a conflict with another machine, take the cloud's index\n"
         "      --prefer-local  on a conflict, keep this machine's index and upload it\n"
+        "      --pad           pad files so the cloud learns their sizes only to within\n"
+        "                      a factor of two (costs up to 2x space for small files)\n"
         "      --cache-size N  keep at most N of encrypted blobs locally (e.g. 500M, 20G);\n"
         "                      older ones the cloud already has are removed and\n"
         "                      downloaded again when needed (default: keep everything)\n"
@@ -1532,6 +1675,7 @@ int main(int argc, char* argv[]) {
     std::string cloudcli_cmd = CloudCLIWrapper::DefaultCommand();
     bool background = false;
     Prefer prefer = Prefer::kNone;
+    bool pad = false;
     uint64_t cache_limit = 0;
     bool debug = false;
 
@@ -1542,6 +1686,7 @@ int main(int argc, char* argv[]) {
         {"background", no_argument, nullptr, 'b'},
         {"cache-size", required_argument, nullptr, 'S'},
         {"prefer-cloud", no_argument, nullptr, 'C'},
+        {"pad", no_argument, nullptr, 'P'},
         {"prefer-local", no_argument, nullptr, 'L'},
         {"debug", no_argument, nullptr, 'd'},
         {"help", no_argument, nullptr, 'h'},
@@ -1556,6 +1701,7 @@ int main(int argc, char* argv[]) {
         case 'c': cloudcli_cmd = optarg; break;
         case 'b': background = true; break;
         case 'C': prefer = Prefer::kCloud; break;
+        case 'P': pad = true; break;
         case 'L': prefer = Prefer::kLocal; break;
         case 'S':
             cache_limit = ParseSize(optarg);
@@ -1646,6 +1792,7 @@ int main(int argc, char* argv[]) {
 
     ctx->index_guard_pending = fresh_index;
     ctx->cache_limit = cache_limit;
+    ctx->pad = pad;
     if (int rc = ReconcileIndexAtMount(*ctx, restored_index, fresh_index, prefer)) return rc;
 
     // Passphrase stores: a changed encfs.kdf travels with a ".pending" marker
@@ -1669,6 +1816,7 @@ int main(int argc, char* argv[]) {
     }
     if (kdf_pending) ctx->cloud->QueueUpload(kdf_path);
     g_ctx = ctx.get();
+    CleanBackingDir();
     ctx->cloud->SetPreUploadHook(BeforeUpload);
     ctx->cloud->SetUploadCallback(OnUploaded);
     if (cache_limit > 0) {

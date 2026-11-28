@@ -129,6 +129,18 @@ public:
     );
 };
 
+// Something that yields a file's plaintext chunk by chunk: one blob
+// (ChunkedReader) or a segmented file (SegmentedReader). Every chunk except
+// the last is chunk_size() bytes.
+class ChunkSource {
+public:
+    virtual ~ChunkSource() = default;
+    virtual uint64_t plaintext_size() const = 0;
+    virtual size_t chunk_size() const = 0;
+    // Decrypt and authenticate chunk `index`; false on any failure.
+    virtual bool ReadChunk(uint64_t index, std::vector<uint8_t>& out) = 0;
+};
+
 // Random-access reader for a v2 blob stored in a file. Because every
 // non-final chunk holds exactly chunk_size bytes, chunk i sits at a fixed
 // offset, so any byte range can be decrypted without touching the rest.
@@ -137,7 +149,7 @@ public:
 // consistent snapshot even if the blob is atomically replaced meanwhile.
 // Nothing is authenticated until ReadChunk() is called; a truncated or
 // extended blob is caught when its final chunk is read (wrong final flag).
-class ChunkedReader {
+class ChunkedReader : public ChunkSource {
 public:
     // Opens `path` and validates the header and overall layout. Returns
     // nullptr if the file can't be opened or isn't a structurally valid v2
@@ -150,13 +162,13 @@ public:
     ChunkedReader(const ChunkedReader&) = delete;
     ChunkedReader& operator=(const ChunkedReader&) = delete;
 
-    uint64_t plaintext_size() const { return plaintext_size_; }
-    size_t chunk_size() const { return chunk_size_; }
+    uint64_t plaintext_size() const override { return plaintext_size_; }
+    size_t chunk_size() const override { return chunk_size_; }
     uint64_t num_chunks() const { return num_chunks_; }
 
     // Decrypt and authenticate chunk `index`. Returns false on I/O error or
     // authentication failure (wrong key/AAD, tampering, truncation).
-    bool ReadChunk(uint64_t index, std::vector<uint8_t>& out);
+    bool ReadChunk(uint64_t index, std::vector<uint8_t>& out) override;
 
     // Copy plaintext bytes [offset, offset + len) into `buf`, decrypting the
     // chunks involved (the most recent chunk is cached). Returns bytes copied

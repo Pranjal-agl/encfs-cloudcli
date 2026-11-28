@@ -15,7 +15,7 @@ const read = (p) => new Uint8Array(readFileSync(p));
 // ── C++ → JS ──
 const { keys, entries, legacyKey } = await encfs.openIndex(read(`${dir}/key`), read(`${dir}/backing/index.enc`));
 check(!legacyKey, "JS opens the C++ index with a hex key file");
-check(entries.generation >= 1, "JS reads index v2 (generation " + entries.generation + ")");
+check(entries.generation >= 1, "JS reads index v3 (generation " + entries.generation + ")");
 const byName = new Map(entries.map((e) => [e.name, e]));
 
 for (const line of readFileSync(`${dir}/expected.tsv`, "utf8").split("\n").filter(Boolean)) {
@@ -27,8 +27,14 @@ for (const line of readFileSync(`${dir}/expected.tsv`, "utf8").split("\n").filte
     check(entry.isSymlink && encfs.toHex(new TextEncoder().encode(entry.target)) === hex, `'${name}' is a symlink to the right target`);
     continue;
   }
-  const blob = read(`${dir}/backing/${entry.remoteId}.enc`);
-  const res = await encfs.decryptFile(keys, blob, entry.remoteId, entry.version);
+  let res;
+  if (entry.segmentSize) {
+    res = await encfs.decryptSegmented(keys, entry, async (id) => {
+      try { return read(`${dir}/backing/${id}.enc`); } catch { return null; }
+    });
+  } else {
+    res = await encfs.decryptFile(keys, read(`${dir}/backing/${entry.remoteId}.enc`), entry.remoteId, entry.version);
+  }
   const same = res.status === status && (status !== "ok" || encfs.toHex(res.plaintext) === hex);
   check(same, `JS decrypts '${name}' → ${res.status}${res.legacy ? " (v1)" : ""}`);
 }
@@ -72,6 +78,25 @@ writeFileSync(`${dir}/js/manifest.tsv`, manifest.join("\n") + "\n");
 jsEntries.push({ name: "js/dir", type: "directory", mode: 0o750, mtime: 1700000100 });
 jsEntries.push({ name: "js/link", type: "symlink", target: "../elsewhere", mode: 0o777 });
 jsEntries.push({ ...jsEntries[1], name: "js/one-hardlink" });  // same inode as js/one
+
+// A segmented file: 300 bytes in 128-byte segments at versions 5, 2, 8.
+{
+  const pt = pattern(300, 9);
+  const inode = encfs.toHex(crypto.getRandomValues(new Uint8Array(32)));
+  const segments = [5n, 2n, 8n];
+  for (const [i, v] of segments.entries()) {
+    const part = pt.slice(i * 128, Math.min(pt.length, (i + 1) * 128));
+    writeFileSync(`${dir}/js/${encfs.segmentObjectId(inode, i, v)}.enc`, await encfs.encryptSegment(keys, part, inode, i, v, 64));
+  }
+  writeFileSync(`${dir}/js/segmented.expected`, encfs.toHex(pt));
+  jsEntries.push({ name: "js/segmented", remoteId: inode, version: 9, size: pt.length, mtime: 1700000200,
+                   segmentSize: 128, chunkSize: 64, segments });
+  // And JS rejects a segment replayed into the wrong position.
+  const seg0 = read(`${dir}/js/${encfs.segmentObjectId(inode, 0, 5n)}.enc`);
+  const swapped = await encfs.decryptSegmented(keys, { remoteId: inode, size: 300, segmentSize: 128, segments },
+    async (id) => id.endsWith(".1.2") ? seg0 : read(`${dir}/js/${id}.enc`));
+  check(swapped.status === "corrupt", "JS rejects a segment moved to another position");
+}
 writeFileSync(`${dir}/js/index.enc`, await encfs.encryptIndex(keys, jsEntries));
 console.log(`  · wrote ${cases.length} JS blobs + index for C++ to verify`);
 

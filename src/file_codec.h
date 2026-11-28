@@ -73,6 +73,21 @@ public:
 
     size_t chunk_size() const { return chunk_size_; }
 
+    // ── Segmented files ──
+    // Segment `seg` of inode `inode_id`, at version `version`, is a v2 blob
+    // whose AAD binds all three: segments can't be moved between positions
+    // or files, and an old version can't stand in for a new one.
+    std::unique_ptr<class ChunkedWriter> NewSegmentWriter(
+        std::function<bool(const uint8_t*, size_t)> write_fn, const std::string& inode_id,
+        uint64_t seg, uint64_t version, size_t chunk_size) const;
+    // kOk with `*reader` set, or kCorrupt.
+    Result OpenSegmentReader(const std::string& path, const std::string& inode_id, uint64_t seg,
+                             uint64_t version, std::unique_ptr<class ChunkedReader>* reader) const;
+    std::vector<uint8_t> EncryptSegment(const std::vector<uint8_t>& plaintext, const std::string& inode_id,
+                                        uint64_t seg, uint64_t version, size_t chunk_size) const;
+    Result DecryptSegment(const std::vector<uint8_t>& blob, const std::string& inode_id, uint64_t seg,
+                          uint64_t version, std::vector<uint8_t>& plaintext) const;
+
     // Chunk size for new blobs (tests use small values to exercise chunking).
     void set_chunk_size(size_t chunk_size) { chunk_size_ = chunk_size; }
 
@@ -83,6 +98,7 @@ private:
     size_t chunk_size_;
 
     static std::vector<uint8_t> Aad(const std::string& remote_id, uint64_t version);
+    static std::vector<uint8_t> SegmentAad(const std::string& inode_id, uint64_t seg, uint64_t version);
 };
 
 } // namespace encfs

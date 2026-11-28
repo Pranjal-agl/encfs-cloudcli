@@ -7,6 +7,7 @@
 #include "cloudcli_wrapper.h"
 #include "crypto.h"
 #include "index.h"
+#include "segments.h"
 #include "index_sync.h"
 #include "key_setup.h"
 #include "util.h"
@@ -172,7 +173,8 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
         return 1;
     }
 
-    uint64_t files = 0, dirs = 0, links = 0, bytes = 0, cached = 0, cached_bytes = 0;
+    uint64_t files = 0, dirs = 0, links = 0, bytes = 0, segmented = 0;
+    uint64_t objects = 0, cached = 0, cached_bytes = 0, local_files = 0;
     for (const FileMetadata& m : index.AllInodes()) {
         if (m.IsDirectory()) {
             ++dirs;
@@ -184,11 +186,19 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
         }
         ++files;
         bytes += m.size;
-        struct stat st;
-        if (::stat((backing_dir + "/" + m.remote_id + ".enc").c_str(), &st) == 0) {
-            ++cached;
-            cached_bytes += static_cast<uint64_t>(st.st_size);
+        if (m.segment_size > 0) ++segmented;
+        bool all_here = true;
+        for (const std::string& id : ObjectIds(m)) {
+            ++objects;
+            struct stat st;
+            if (::stat((backing_dir + "/" + id + ".enc").c_str(), &st) == 0) {
+                ++cached;
+                cached_bytes += static_cast<uint64_t>(st.st_size);
+            } else {
+                all_here = false;
+            }
         }
+        if (all_here) ++local_files;
     }
 
     auto count_lines = [](const std::string& path) {
@@ -205,8 +215,12 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
     std::cout << "Store:          " << backing_dir << "\n"
               << "Files:          " << files << " in " << dirs << " directories, " << HumanBytes(bytes)
               << (links ? ", plus " + std::to_string(links) + " symbolic link(s)" : std::string()) << "\n"
-              << "Cached locally: " << cached << " of " << files << " blobs, " << HumanBytes(cached_bytes)
-              << (cached < files ? " (the rest are fetched from the cloud when opened)" : "") << "\n"
+              << "Stored as:      " << objects << " encrypted object(s)"
+              << (segmented ? " (" + std::to_string(segmented) + " large file(s) split into segments)" : std::string())
+              << "\n"
+              << "Cached locally: " << cached << " of " << objects << " objects, " << HumanBytes(cached_bytes) << "; "
+              << local_files << " of " << files << " files entirely local"
+              << (cached < objects ? " (the rest are fetched from the cloud when read)" : "") << "\n"
               << "Pending sync:   " << pending << " operation(s)"
               << (pending ? " (finished on the next mount)" : "") << "\n";
     {
@@ -223,7 +237,7 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
     }
     if (has_synced) {
         std::cout << "Confirmed:      " << count_lines(backing_dir + "/synced.list")
-                  << " blob(s) known to be in the cloud at their current version\n";
+                  << " object(s) known to be in the cloud at their current version\n";
     }
     if (opts.use_passphrase) {
         std::vector<uint8_t> raw;

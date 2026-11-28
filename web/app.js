@@ -260,7 +260,8 @@ function formatSize(n) {
 
 function addBackingFiles(list) {
   for (const f of list) vault.files.set(f.name, f);
-  const blobs = [...vault.files.keys()].filter((n) => /^[0-9a-f]{64}\.enc$/.test(n)).length;
+  // Whole-file blobs are `<id>.enc`; segments of large files `<id>.<seg>.<ver>.enc`.
+  const blobs = [...vault.files.keys()].filter((n) => /^[0-9a-f]{64}(\.\d+\.\d+)?\.enc$/.test(n)).length;
   const has = (n) => vault.files.has(n);
   const parts = [`${blobs} encrypted blob${blobs === 1 ? "" : "s"}`];
   parts.push(has("index.enc") ? "the index" : "no index.enc yet");
@@ -325,6 +326,11 @@ function blobFor(entry) {
   return vault.files.get(`${entry.remoteId}.enc`);
 }
 
+// Every stored object this entry needs is in the chosen folder.
+function hasAllObjects(entry) {
+  return encfs.objectIds(entry).every((id) => vault.files.has(`${id}.enc`));
+}
+
 function renderFileList() {
   const entries = [...vault.entries].sort((a, b) => a.name.localeCompare(b.name));
   const tbody = el("tbody");
@@ -345,7 +351,7 @@ function renderFileList() {
       continue;
     }
     nameCell.append(base);
-    const present = Boolean(blobFor(entry)) || entry.size === 0;
+    const present = hasAllObjects(entry) || (entry.size === 0 && !entry.segmentSize);
     const state = el("span", {
       class: `state ${present ? "" : "missing"}`,
       text: present ? "Ready" : "Blob not in this folder",
@@ -371,6 +377,12 @@ function renderFileList() {
 }
 
 async function decryptEntry(entry) {
+  if (entry.segmentSize) {
+    return encfs.decryptSegmented(vault.keys, entry, async (id) => {
+      const f = vault.files.get(`${id}.enc`);
+      return f ? readFile(f) : null;
+    });
+  }
   const blob = blobFor(entry);
   if (!blob) {
     if (entry.size === 0) return { status: "ok", plaintext: new Uint8Array() };

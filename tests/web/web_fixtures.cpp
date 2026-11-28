@@ -9,6 +9,7 @@
 #include "file_codec.h"
 #include "index.h"
 #include "key_setup.h"
+#include "segments.h"
 #include "util.h"
 
 #include <openssl/evp.h>
@@ -135,6 +136,34 @@ int Gen(const std::string& dir) {
     Write(backing + "/" + legacy.remote_id + ".enc", V1Blob(legacy_pt, master, 64));
     expected << "legacy.bin\tok\t" << HexEncode(legacy_pt.data(), legacy_pt.size()) << "\n";
 
+    // Segmented files: 256-byte segments of 64-byte chunks, at mixed
+    // versions (only edited segments are rewritten), last one padded.
+    auto add_segmented = [&](const std::string& name, const std::vector<uint8_t>& pt,
+                             const std::vector<uint64_t>& versions, const std::string& status,
+                             bool swap_first_two) {
+        FileMetadata meta;
+        meta.remote_id = NewInodeId();
+        meta.version = 9;
+        meta.size = pt.size();
+        meta.segment_size = 256;
+        meta.chunk_size = 64;
+        meta.segments = versions;
+        index.SetMetadata(name, meta);
+        for (size_t i = 0; i < versions.size(); ++i) {
+            size_t start = i * 256, len = std::min<size_t>(256, pt.size() - start);
+            std::vector<uint8_t> part(pt.begin() + static_cast<long>(start), pt.begin() + static_cast<long>(start + len));
+            if (i + 1 == versions.size()) part.resize(PaddedLength(len, 256), 0);
+            size_t at = swap_first_two && i < 2 ? 1 - i : i;  // stored under the other position's name
+            Write(backing + "/" + SegmentObjectId(meta.remote_id, at, versions[at]) + ".enc",
+                  codec.EncryptSegment(part, meta.remote_id, i, versions[i], 64));
+        }
+        expected << name << "\t" << status << "\t" << (status == "ok" ? HexEncode(pt.data(), pt.size()) : "")
+                 << "\n";
+    };
+    add_segmented("seg/big.bin", Pattern(1000, ++seed), {2, 7, 7, 4}, "ok", false);
+    add_segmented("seg/one.bin", Pattern(10, ++seed), {1}, "ok", false);
+    add_segmented("seg/reordered.bin", Pattern(600, ++seed), {3, 3, 3}, "corrupt", true);
+
     if (!index.Save()) throw std::runtime_error("index save failed");
     std::string exp = expected.str();
     Write(dir + "/expected.tsv", Bytes(exp));
@@ -195,7 +224,26 @@ int Verify(const std::string& dir) {
     }
 
     EncryptedIndex index(dir + "/js", master);
-    bool index_ok = index.Load() && index.Size() == names.size() + 3;
+    bool index_ok = index.Load() && index.Size() == names.size() + 4;
+
+    // A segmented file the JS side wrote.
+    FileMetadata seg;
+    bool seg_ok = index_ok && index.GetMetadata("js/segmented", seg) && seg.segment_size == 128 &&
+                  seg.chunk_size == 64 && seg.segments.size() == 3;
+    std::vector<uint8_t> joined, want;
+    for (size_t i = 0; seg_ok && i < seg.segments.size(); ++i) {
+        std::vector<uint8_t> blob, part;
+        seg_ok = ReadWholeFile(dir + "/js/" + SegmentObjectId(seg.remote_id, i, seg.segments[i]) + ".enc", blob) &&
+                 codec.DecryptSegment(blob, seg.remote_id, i, seg.segments[i], part) == FileCodec::Result::kOk;
+        joined.insert(joined.end(), part.begin(), part.end());
+    }
+    std::vector<uint8_t> expected_seg;
+    ReadWholeFile(dir + "/js/segmented.expected", expected_seg);
+    HexDecode(std::string(expected_seg.begin(), expected_seg.end()), want);
+    joined.resize(std::min<size_t>(joined.size(), seg.size));
+    seg_ok = seg_ok && joined == want;
+    std::cout << (seg_ok ? "  ✓ " : "  ✗ ") << "C++ decrypts a JS-written segmented file\n";
+    if (!seg_ok) ++failed;
     for (const auto& n : names) {
         FileMetadata m;
         index_ok = index_ok && index.GetMetadata(n, m) && m.remote_id == codec.RemoteIdFor(n);

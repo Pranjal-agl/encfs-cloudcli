@@ -62,6 +62,7 @@ trap cleanup EXIT
 
 blob_ids() { find "$BACK" -maxdepth 1 -name '*.enc' ! -name index.enc -printf '%f\n' | sed 's/\.enc$//' | sort; }
 cloud_ids() { find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name '.*' ! -name index ! -name encfs.kdf -printf '%f\n' | sort; }
+cloud_files() { cloud_ids | cut -c1-64 | sort -u; }  # one inode may span several segment objects
 
 echo "Running FUSE end-to-end tests in $WORK"
 if ! mount_fs; then
@@ -134,7 +135,7 @@ check "no plaintext names/data in backing dir" \
 # ── Unmount: pending uploads/deletes must be flushed ──
 unmount_fs
 check "cloud matches backing dir after unmount" [ "$(blob_ids)" = "$(cloud_ids)" ]
-check "cloud holds one blob per file"           [ "$(cloud_ids | wc -l)" = 6 ]
+check "cloud holds every file (and only those)"  [ "$(cloud_files | wc -l)" = 6 ]
 check "no sync journal left behind"             [ ! -e "$BACK/sync.journal" ]
 check "encrypted index uploaded to the cloud"   cmp -s "$BACK/index.enc" "$ENCFS_STUB_STORE/index"
 
@@ -250,7 +251,7 @@ check "decrypt_by_name with a path" \
 rm -r "$MNT/proj"
 check "rm -r removes the tree"         [ ! -e "$MNT/proj" ]
 unmount_fs
-check "no orphaned blobs in the cloud" [ "$(cloud_ids | wc -l)" = 6 ]
+check "no orphaned blobs in the cloud" [ "$(cloud_files | wc -l)" = 6 ]
 
 # ── Offline verify and export ──
 check "decrypt_by_name --verify passes" \
@@ -584,6 +585,115 @@ check "restore on a new machine with the new passphrase" \
     [ "$(ENCFS_PASSPHRASE=second "$DECRYPT_BIN" -p -c "$STUB" "$CTL_WORK/fresh" p.txt - 2>/dev/null)" = "guarded by a passphrase" ]
 STATUS=$(ENCFS_PASSPHRASE=second "$CTL_BIN" status -p "$BACK" 2>&1)
 check "status reports files and the KDF"   bash -c "grep -q 'Files: *1 in 0 directories' <<<\"\$0\" && grep -q 'encfs.kdf v2' <<<\"\$0\"" "$STATUS"
+BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
+
+# ── Large files: segments, incremental sync, padding ──
+# Files are stored as 4 MiB segments; an edit re-uploads only the segments
+# it touched, and a read downloads only the segments it needs.
+MAIN_BACK="$BACK"; MAIN_STORE="$ENCFS_STUB_STORE"
+SEG="$WORK/seg"; mkdir -p "$SEG"
+BACK="$SEG/backing"; export ENCFS_STUB_STORE="$SEG/cloud"
+log_mark() { wc -l < "$LOG"; }
+log_since() { tail -n +"$(( $1 + 1 ))" "$LOG"; }
+uploads_since() { log_since "$1" | grep '^Uploaded ' | grep -vc -e ' -> index$' -e ' -> encfs.kdf$'; }
+deletes_since() { log_since "$1" | grep -c '^Deleted '; }
+downloads_since() { log_since "$1" | grep '^Downloaded ' | grep -vc -e '^Downloaded index ' -e '^Downloaded encfs.kdf '; }
+local_objects() { find "$BACK" -maxdepth 1 -name '*.enc' ! -name index.enc | wc -l; }
+
+head -c 18000000 /dev/urandom > "$SEG/src"   # 5 segments: 4 × 4 MiB + 1.2 MB
+mount_fs || fail "mount (segments)"
+cp "$SEG/src" "$MNT/large.bin"
+unmount_fs
+check "a large file is stored as 5 segment objects" [ "$(cloud_ids | wc -l)" = 5 ]
+check "...named <inode>.<segment>.<version>"  [ "$(cloud_ids | grep -cE '^[0-9a-f]{64}\.[0-4]\.[0-9]+$')" = 5 ]
+
+# Change one byte in the middle (segment 2).
+printf 'Z' | dd of="$SEG/src" bs=1 seek=9000000 conv=notrunc status=none
+MARK=$(log_mark)
+mount_fs || fail "mount (one-byte edit)"
+printf 'Z' | dd of="$MNT/large.bin" bs=1 seek=9000000 conv=notrunc status=none
+unmount_fs
+check "a one-byte edit uploads exactly one segment" [ "$(uploads_since "$MARK")" = 1 ]
+check "...and deletes only the segment it replaced" [ "$(deletes_since "$MARK")" = 1 ]
+check "the cloud still holds 5 segments"           [ "$(cloud_ids | wc -l)" = 5 ]
+mount_fs || fail "mount (after edit)"
+check "the edited file reads back correctly"        cmp -s "$SEG/src" "$MNT/large.bin"
+unmount_fs
+
+# Appending rewrites only the old last segment and adds new ones.
+head -c 5000000 /dev/urandom > "$SEG/more"
+cat "$SEG/more" >> "$SEG/src"
+MARK=$(log_mark)
+mount_fs || fail "mount (append)"
+cat "$SEG/more" >> "$MNT/large.bin"
+unmount_fs
+check "appending 5 MB uploads 2 segments, not 6"   [ "$(uploads_since "$MARK")" = 2 ]
+mount_fs || fail "mount (after append)"
+check "the appended file reads back correctly"     cmp -s "$SEG/src" "$MNT/large.bin"
+unmount_fs
+
+# A new machine downloads only what it reads.
+BACK="$SEG/backing_B"
+MARK=$(log_mark)
+mount_fs || fail "mount (fresh machine)"
+check "reading the first KiB works"                [ "$(head -c 1024 "$MNT/large.bin" | cmp -s - <(head -c 1024 "$SEG/src") && echo ok)" = ok ]
+check "...and downloads only the first segment"    [ "$(downloads_since "$MARK")" = 1 ]
+check "...so only one object is cached locally"    [ "$(local_objects)" = 1 ]
+check "reading the end fetches the last segment"   cmp -s <(tail -c 1000 "$MNT/large.bin") <(tail -c 1000 "$SEG/src")
+check "...two objects downloaded in all"           [ "$(downloads_since "$MARK")" = 2 ]
+check "a full read gets every segment"             cmp -s "$SEG/src" "$MNT/large.bin"
+check "...each exactly once"                       [ "$(downloads_since "$MARK")" = 6 ]
+
+# Truncating drops the segments past the new end.
+truncate -s 5000000 "$MNT/large.bin"
+truncate -s 5000000 "$SEG/src"
+unmount_fs
+check "truncating leaves 2 segments in the cloud"  [ "$(cloud_ids | wc -l)" = 2 ]
+check "...and 2 locally"                           [ "$(local_objects)" = 2 ]
+BACK="$SEG/backing"
+mount_fs || fail "mount (machine A after truncate)"
+check "machine A sees the truncated file"          cmp -s "$SEG/src" "$MNT/large.bin"
+check "...and dropped its stale segments"          [ "$(local_objects)" -le 2 ]
+unmount_fs
+
+# Offline tools understand segmented files.
+check "decrypt_by_name restores a segmented file" \
+    cmp -s "$SEG/src" <("$DECRYPT_BIN" -k "$KEY" -c "$STUB" "$SEG/backing" large.bin - 2>/dev/null)
+check "...from the cloud alone" \
+    cmp -s "$SEG/src" <("$DECRYPT_BIN" -k "$KEY" -c "$STUB" "$SEG/fresh" large.bin - 2>/dev/null)
+check "--verify passes"                            quiet "$DECRYPT_BIN" -k "$KEY" -c "$STUB" --verify "$SEG/backing"
+VICTIM=$(find "$SEG/backing" -maxdepth 1 -name '*.1.*.enc' | head -1)
+cp "$VICTIM" "$SEG/victim.bak"
+printf 'X' | dd of="$VICTIM" bs=1 seek=200 conv=notrunc status=none
+check_fails "--verify catches a tampered segment"  quiet "$DECRYPT_BIN" -k "$KEY" -c "$STUB" --verify "$SEG/backing"
+cp "$SEG/victim.bak" "$VICTIM"
+SEG0=$(find "$SEG/backing" -maxdepth 1 -name '*.0.*.enc' | head -1)
+cp "$VICTIM" "$SEG/victim.bak"; cp "$SEG0" "$VICTIM"
+check_fails "--verify catches a segment moved to another position" \
+    quiet "$DECRYPT_BIN" -k "$KEY" -c "$STUB" --verify "$SEG/backing"
+cp "$SEG/victim.bak" "$VICTIM"
+mount_fs || fail "mount (after restoring the segment)"
+check "status counts segment objects" \
+    bash -c "'$CTL_BIN' status -k '$KEY' '$BACK' | grep -q '2 encrypted object(s) (1 large file(s) split into segments)'"
+unmount_fs
+
+# --pad: the cloud learns sizes only to within a power of two.
+BACK="$SEG/pad_backing"; export ENCFS_STUB_STORE="$SEG/pad_cloud"
+EXTRA_ARGS=(--pad)
+mount_fs || fail "mount (--pad)"
+head -c 2500 /dev/urandom > "$MNT/a"
+head -c 4000 /dev/urandom > "$MNT/b"
+head -c 10 /dev/urandom > "$MNT/c"
+check "padded files keep their real size"          [ "$(stat -c %s "$MNT/a")" = 2500 ]
+unmount_fs
+EXTRA_ARGS=()
+pad_sizes=$(find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name index ! -name '.*' -printf '%s\n' | sort -n | uniq | tr '\n' ' ')
+check "2500 and 4000 bytes look alike in the cloud" \
+    [ "$(find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name index ! -name '.*' -printf '%s\n' | sort -n | uniq -c | awk '$1 == 2' | wc -l)" = 1 ]
+check "a tiny file is padded to at least 1 KiB"    [ "${pad_sizes%% *}" -gt 1024 ]
+mount_fs || fail "mount (read padded)"
+check "padded files read back at their real size"  [ "$(wc -c < "$MNT/c") $(wc -c < "$MNT/b")" = "10 4000" ]
+unmount_fs
 BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
 
 echo
