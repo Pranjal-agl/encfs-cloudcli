@@ -95,4 +95,18 @@ int AdoptFetchedCloudIndex(const std::string& backing_dir, EncryptedIndex& index
     return removed;
 }
 
+bool FetchFromCloud(CloudCLIWrapper& cloud, const std::string& remote_id, const std::string& path) {
+    const std::string tmp = path + ".download";
+    if (cloud.Download(remote_id, tmp) && ::rename(tmp.c_str(), path.c_str()) == 0) {
+        return true;
+    }
+    ::unlink(tmp.c_str());
+    return false;
+}
+
+bool JournalHasWork(const std::string& backing_dir) {
+    struct stat st;
+    return ::stat((backing_dir + "/sync.journal").c_str(), &st) == 0 && st.st_size > 0;
+}
+
 } // namespace encfs

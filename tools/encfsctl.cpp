@@ -3,6 +3,7 @@
 //   encfsctl init   [--key FILE | --passphrase] <backing_dir>
 //   encfsctl passwd [--cloudcli CMD] <backing_dir>
 //   encfsctl status [--key FILE | --passphrase] <backing_dir>
+//   encfsctl rekey  [--key FILE | --passphrase] [--cloudcli CMD] <backing_dir>
 
 #include "cloudcli_wrapper.h"
 #include "crypto.h"
@@ -10,6 +11,7 @@
 #include "segments.h"
 #include "index_sync.h"
 #include "key_setup.h"
+#include "rekey.h"
 #include "util.h"
 
 #include <dirent.h>
@@ -33,6 +35,10 @@ void Usage() {
         "           re-encrypted; the new encfs.kdf is uploaded to the cloud.\n"
         "           Reads $ENCFS_PASSPHRASE / $ENCFS_NEW_PASSPHRASE, or prompts.\n"
         "  status   Show files, sizes, local cache use and pending cloud operations\n"
+        "  rekey    Re-encrypt everything under a new master key (if a key file or\n"
+        "           passphrase may have leaked). Key file: the new key replaces the\n"
+        "           old one, which is kept as <key>.<id>.old. Passphrase: unchanged,\n"
+        "           it now unlocks the new key. Resumable; needs the cloud.\n"
         "\n"
         "Options:\n"
         "  -k, --key FILE      key file (default: $ENCFS_KEY_FILE or ~/.encfs/key)\n"
@@ -104,6 +110,15 @@ int Init(const KeyOptions& opts, const std::string& backing_dir) {
 }
 
 int Passwd(const std::string& cloudcli_cmd, const std::string& backing_dir) {
+    DirLock lock;
+    if (!lock.Acquire(backing_dir)) {
+        std::cerr << "Error: " << backing_dir << " is in use (mounted, or being re-keyed). Unmount it first.\n";
+        return 1;
+    }
+    if (RekeyInProgress(backing_dir)) {
+        std::cerr << "Error: a re-key of this store is unfinished; run `encfsctl rekey` again first.\n";
+        return 1;
+    }
     CloudCLIWrapper cloud(cloudcli_cmd);
     const std::string kdf_path = backing_dir + "/encfs.kdf";
     if (!PassphraseStoreExists(backing_dir)) {
@@ -155,7 +170,7 @@ int Passwd(const std::string& cloudcli_cmd, const std::string& backing_dir) {
     }
     std::cout << "Note: the master key is unchanged, so anyone holding an old copy of encfs.kdf\n"
                  "and the old passphrase can still unlock the store. If the old passphrase was\n"
-                 "compromised, re-encrypt into a new store (decrypt_by_name --extract-all).\n";
+                 "compromised, also run `encfsctl rekey --passphrase` to replace the key.\n";
     return 0;
 }
 
@@ -167,6 +182,7 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
         return 1;
     }
     EncryptedIndex index(backing_dir, master);
+    const std::string key_id = KeyId(master);
     SecureWipe(master);
     if (!index.FileExists() || !index.Load()) {
         std::cerr << "Error: no readable index in " << backing_dir << "\n";
@@ -248,6 +264,10 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
     } else {
         std::cout << "Key:            " << (opts.key_path.empty() ? DefaultKeyPath() : opts.key_path) << "\n";
     }
+    std::cout << "Key ID:         " << key_id.substr(0, 8) << "\n";
+    if (RekeyInProgress(backing_dir)) {
+        std::cout << "Re-key:         unfinished — run `encfsctl rekey` again to complete it\n";
+    }
     return 0;
 }
 
@@ -294,6 +314,7 @@ int main(int argc, char* argv[]) {
         if (command == "init") return Init(opts, backing_dir);
         if (command == "passwd") return Passwd(cloudcli_cmd, backing_dir);
         if (command == "status") return Status(opts, backing_dir);
+        if (command == "rekey") return RunRekey(RekeyOptions{opts, cloudcli_cmd}, backing_dir);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;

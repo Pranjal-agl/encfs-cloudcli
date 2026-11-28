@@ -52,4 +52,10 @@ bool SaveSyncedGeneration(const std::string& backing_dir, uint64_t generation);
 // -1 on failure.
 int AdoptFetchedCloudIndex(const std::string& backing_dir, EncryptedIndex& index, const FileCodec& codec);
 
+// Download a cloud object to `path` atomically (temp file + rename).
+bool FetchFromCloud(CloudCLIWrapper& cloud, const std::string& remote_id, const std::string& path);
+
+// Does <backing_dir>/sync.journal hold unfinished cloud operations?
+bool JournalHasWork(const std::string& backing_dir);
+
 } // namespace encfs

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -203,6 +204,27 @@ void SecureWipe(std::vector<uint8_t>& buf) {
 
 void SecureWipe(std::string& buf) {
     if (!buf.empty()) OPENSSL_cleanse(&buf[0], buf.size());
+}
+
+// ── DirLock ─────────────────────────────────────────────────────────────────
+
+bool DirLock::Acquire(const std::string& dir) {
+    if (fd_ >= 0) return true;
+    const std::string path = dir + "/.lock";
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        ::close(fd);
+        return false;
+    }
+    fd_ = fd;
+    return true;
+}
+
+DirLock::~DirLock() {
+    // Only close: an explicit unlock would also release the lock for a
+    // forked child that still uses the directory.
+    if (fd_ >= 0) ::close(fd_);
 }
 
 } // namespace encfs

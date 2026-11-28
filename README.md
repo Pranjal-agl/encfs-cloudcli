@@ -26,6 +26,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **On-demand downloads** — data is fetched from the cloud only when read, a segment at a time, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — a key file, or a passphrase that wraps a random master key (PBKDF2-HMAC-SHA256, 600k iterations). The passphrase can be changed without re-encrypting anything.
+- **Key rotation** — `encfsctl rekey` re-encrypts the whole store under a new master key, resumably. Other machines notice on their next mount and switch over without losing anything.
 - **A real POSIX namespace** — directories, hard links, symbolic links and stored permission bits. Renames, including whole directories and `RENAME_EXCHANGE`, are atomic and instant because they only touch the index.
 - **Works with everyday tools** — append, partial overwrite, truncate, `mv`, `touch`, `cp -rp`, `tar`, `rsync -a`, `find`, `df`
 
@@ -179,7 +180,7 @@ cmake --build build -j"$(nproc)"
 | Binary | Description |
 |---|---|
 | `encrypted_cloudfs` | The FUSE filesystem |
-| `encfsctl` | Set up a store (`init`), change its passphrase (`passwd`), show its state (`status`) |
+| `encfsctl` | Set up a store (`init`), change its passphrase (`passwd`), show its state (`status`), replace its key (`rekey`) |
 | `decrypt_by_name` | List, verify, recover or export files without mounting |
 | `test_crypto`, `test_index`, `test_integration` | Test suites |
 
@@ -235,8 +236,29 @@ If the backing directory already has an index, the key must be able to decrypt i
 - A wrong passphrase is rejected immediately, even before the store has any files.
 - `passwd` uploads the new `encfs.kdf` straight away, and every mount uploads it again in case that failed.
 - Stores created before v2.10 used the passphrase to derive the master key directly (KDF v1). `passwd` upgrades them in place, around the same key.
-- Changing a passphrase doesn't change the master key. If an old passphrase leaked *and* someone kept an old `encfs.kdf`, they can still unlock the store. To fully re-key, `decrypt_by_name --extract-all` and copy the files into a new store.
+- Changing a passphrase doesn't change the master key. If an old passphrase leaked *and* someone kept an old `encfs.kdf`, they can still unlock the store. Run `encfsctl rekey --passphrase` to replace the master key too (see below).
 
+### Replacing the key (`encfsctl rekey`)
+
+If a key file or passphrase may have leaked, replace the master key:
+
+```bash
+./build/encfsctl rekey ~/enc_backing                 # key file: writes a new ~/.encfs/key
+./build/encfsctl rekey --passphrase ~/enc_backing    # passphrase: same passphrase, new key under it
+```
+
+Unmount first. Rekey needs the cloud, and this machine must be in sync with it.
+
+1. **Prepare.** A new random master key is generated, and every file is re-encrypted under it into new objects (new versions, so no name is ever reused). A new index is written. All of this is staged in `rekey/`, the new key file goes to `<key>.new`, and nothing leaves the machine yet.
+2. **Upload.** The new objects are uploaded, then the new index and `encfs.kdf`, and last a public **key ID** (`encfs.keyid`, a fingerprint of the key that reveals nothing about it). Before replacing the cloud's index, rekey checks that no other machine has written to the store since it started.
+3. **Switch over locally.** The new key file is installed, and the old one is kept as `<key>.<old id>.old`. Then the new `encfs.kdf` and index are installed.
+4. **Clean up.** The old objects are deleted here and in the cloud. Deletes that fail stay in the sync journal, and the next mount finishes them.
+
+Every step can be resumed. If rekey stops partway (crash, cloud failure, Ctrl-C), run it again. Until it has finished, mounting is refused and `encfsctl status` says so. Before step 2 replaces the cloud's index, the store remains fully valid under the old key.
+
+**Other machines.** With a key file, copy the new key to them. With a passphrase, nothing is needed: the new `encfs.kdf` is fetched automatically. On its next mount, each machine compares its key ID with the cloud's. If they differ, it moves its old copy (index, objects, sync state) into `rekeyed-<id>-<time>/` inside its backing directory and restores from the cloud. Nothing is deleted: that directory is still a complete backing directory for the old key, so `decrypt_by_name -k <old key> <that dir> …` reads anything that hadn't been synced. A machine still using the old key is refused with an explanation.
+
+**Limits.** Rekey protects everything from now on. Anyone who already copied old objects, or a provider that keeps old versions of objects, still has data readable with the old key. If the old key leaked, delete such versions at the provider. Rekey needs room for a second copy of every file it re-encrypts, plus downloads of files not cached locally (each is deleted once re-encrypted). A store still on a legacy 128-bit key file (see *Upgrading from v1*) gets a full-strength key this way.
 ### Using several machines
 
 Point several machines at the same cloud store with the same key or passphrase, and each mount picks up what the others did. Every index save bumps a generation number, and each backing directory remembers, in `cloud.gen`, the cloud generation it last synced with. Comparing the three at mount:
@@ -249,6 +271,8 @@ Point several machines at the same cloud store with the same key or passphrase, 
 | older | anything | **refuse**: the cloud index was rolled back or replaced |
 
 The same check runs before every index upload. If two machines are mounted at once and one uploads, the other notices before it would overwrite that upload: it stops uploading, refuses further writes, and asks for a remount to resolve.
+
+Each backing directory can be used by only one process at a time. A second mount, or `encfsctl rekey`/`passwd` on a mounted store, is refused, and the lock follows a `--background` mount into its daemon.
 
 Uploads are ordered so the index is always uploaded after the blobs it refers to. A passphrase changed on one machine (`encfsctl passwd`) reaches the others on their next mount, rather than being reverted by them.
 
@@ -299,8 +323,8 @@ ctest --test-dir build --output-on-failure      # all suites (add -DENCFS_E2E=ON
 
 - **test_crypto**: RFC 4231 HMAC vector; round trips at every chunk boundary; a single-bit flip at *every* byte position of a blob; truncation, extension, reordering, cross-file splicing and header grafting; streaming ↔ in-memory interoperability; v1 compatibility.
 - **test_index**: persistence, wrong key/corruption handling (state left untouched), on-disk format stability, unusual filenames.
-- **test_integration**: blob ↔ file/version binding, key resolution (hex, raw, legacy, wrong key, passphrase), the cloudcli wrapper against the stub (including shell-metacharacter paths), queue coalescing, retries and journal recovery.
-- **tests/e2e/run_e2e.sh**: mounts the real filesystem and drives it with `echo`, `cat`, `dd`, `truncate`, `mv`, `cp -p`, `touch -d`. Also checks that the cloud matches the backing dir after unmount, that evicted blobs are re-downloaded, and that tampered or swapped blobs and wrong keys are rejected. It also covers directories, restoring from the cloud alone, the cache limit (including with the cloud down), and `decrypt_by_name --verify`/`--extract-all`.
+- **test_integration**: blob ↔ file/version binding, key resolution (hex, raw, legacy, wrong key, passphrase), the cloudcli wrapper against the stub (including shell-metacharacter paths), queue coalescing, retries and journal recovery, key IDs, setting a copy aside after a re-key, and the backing-directory lock (including across `fork`).
+- **tests/e2e/run_e2e.sh**: mounts the real filesystem and drives it with `echo`, `cat`, `dd`, `truncate`, `mv`, `cp -p`, `touch -d`. Also checks that the cloud matches the backing dir after unmount, that evicted blobs are re-downloaded, and that tampered or swapped blobs and wrong keys are rejected. It also covers directories, restoring from the cloud alone, the cache limit (including with the cloud down), `decrypt_by_name --verify`/`--extract-all`, several machines, segments, padding, and `encfsctl rekey` (interrupted and resumed, on other machines, with passphrases).
 - **test_contents**: thousands of random writes, truncates, reads and save-and-rebase cycles on `FileContents`, checked against an in-memory model with a 2-chunk cache to force spilling.
 - **test_segments**: object names, padding, the segment AAD binding (position, version, inode), `SegmentedReader`'s length checks and lazy opening, the `EIX3` fields, and which chunks an edit marks as changed.
 - **tests/web**: `web/encfs.js` and the C++ code read each other's blobs and indexes.
@@ -315,6 +339,7 @@ CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan bu
 - Keep the key file at mode `0600`; the tools warn if it's readable by others.
 - Plaintext filenames and contents never appear in cloud storage or the backing directory.
 - What *is* visible to the cloud: the number of files, their approximate sizes (only to within a power of two with `--pad`), when they change, and which 4 MiB regions of a large file an edit touched.
+- The cloud also holds `encfs.keyid`, a fingerprint (HMAC) of the current master key, so machines can tell when the store was re-keyed. It can't be used to recover or test the key without the key itself.
 - New files get random IDs. Nothing in the cloud relates to a path, so re-creating a file under the same name, or renaming one, is invisible to the cloud. Files created before v3.0 keep their old path-derived IDs, which are still opaque.
 - Key material and decrypted buffers are wiped (`OPENSSL_cleanse`) when no longer needed.
 
@@ -326,17 +351,25 @@ CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan bu
 
 ### Upgrading from v1
 
-v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* of a hex key file as the key (128 bits of entropy), whereas v2 decodes the hex properly (256 bits). Backing directories created by v1 are detected and still open, with a warning. To upgrade one, run `decrypt_by_name --extract-all` on it, then copy the export into a fresh mount.
+v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* of a hex key file as the key (128 bits of entropy), whereas v2 decodes the hex properly (256 bits). Backing directories created by v1 are detected and still open, with a warning. To upgrade one, run `encfsctl rekey` on it: every file is re-encrypted under a new 256-bit key, which replaces the key file.
 
 ---
 
 ## Roadmap
 
-- Master key rotation (`encfsctl rekey`)
+- Nothing planned. Ideas and issues are welcome.
 
 ---
 
 ## Changelog
+
+### v3.3 — key rotation
+
+- **`encfsctl rekey`:** re-encrypts every file under a new master key and replaces the key file, or the key under an unchanged passphrase. It's staged and resumable: an upload failure or crash at any point is finished by running it again. The cloud stays valid under the old key until the new index replaces the old one, and old objects are deleted only after the switch, through the sync journal.
+- **Key IDs:** each store records a public fingerprint of its key, locally and in the cloud. A machine whose copy is under an old key moves that copy aside, intact, and restores from the cloud. One still using the old key is told why it's refused.
+- **One process per backing directory:** a lock (`.lock`, held across `--background` daemonisation) stops a second mount, or `rekey`/`passwd` on a mounted store.
+- Legacy 128-bit key files can be upgraded in place with `rekey`.
+- e2e: rekey with lock refusal, an interrupted upload and its resume, a stale key on another machine, a copy from before key IDs, passphrase stores, and failed deletes finished by the next mount. Integration tests cover key IDs, setting a copy aside, and the lock across `fork`.
 
 ### v3.2 — incremental sync
 

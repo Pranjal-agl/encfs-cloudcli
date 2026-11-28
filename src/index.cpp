@@ -74,6 +74,13 @@ EncryptedIndex::EncryptedIndex(const std::string& backing_dir, const std::vector
     : index_path_(backing_dir + "/index.enc"), key_(key) {
 }
 
+void EncryptedIndex::Retarget(const std::string& backing_dir, const std::vector<uint8_t>& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    index_path_ = backing_dir + "/index.enc";
+    SecureWipe(key_);
+    key_ = key;
+}
+
 std::vector<uint8_t> EncryptedIndex::DeriveIndexKey() const {
     return KeyManager::DeriveSubkey(key_, "encfs_index_key_derivation");
 }
