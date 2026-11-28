@@ -3,13 +3,16 @@
 #include "file_codec.h"
 #include "index.h"
 #include "key_setup.h"
+#include "rekey.h"
 #include "util.h"
 #include "../test_util.h"
 
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef ENCFS_STUB_PATH
@@ -397,6 +400,106 @@ void TestEndToEndWithoutFuse() {
     CHECK(out == pt);
 }
 
+// ── Re-keying support ───────────────────────────────────────────────────────
+
+void TestKeyIds() {
+    const std::vector<uint8_t> other(32, 0x43);
+    const std::string id = KeyId(kKey);
+    CHECK(id.size() == 32 && id == KeyId(kKey));        // deterministic
+    CHECK(id != KeyId(other));                          // distinct keys, distinct IDs
+    CHECK(id.find("4242") == std::string::npos);        // not the key itself
+
+    TempDir dir;
+    CHECK(WriteKeyId(KeyIdPath(dir.path()), id));
+    std::string back;
+    CHECK(ReadKeyId(KeyIdPath(dir.path()), &back) && back == id);
+    struct stat st;
+    CHECK(::stat(KeyIdPath(dir.path()).c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+    for (const std::string& bad : std::vector<std::string>{"", "ENCFS-KEYID-1 ", "ENCFS-KEYID-1 xyz",
+                                  "ENCFS-KEYID-1 " + std::string(31, 'a'),
+                                  "ENCFS-KEYID-1 " + std::string(31, 'a') + "g",
+                                  "ENCFS-KEYID-2 " + id, id}) {
+        WriteText(dir / "bad", bad);
+        CHECK(!ReadKeyId(dir / "bad", &back));
+    }
+    CHECK(!ReadKeyId(dir / "missing", &back));
+
+    // Through the cloud.
+    StubStore store;
+    CloudCLIWrapper cloud(ENCFS_STUB_PATH);
+    CHECK(!FetchCloudKeyId(cloud, dir.path(), &back));
+    CHECK(cloud.Upload(KeyIdPath(dir.path())));
+    CHECK(Exists(store / kKeyIdObject));
+    CHECK(FetchCloudKeyId(cloud, dir.path(), &back) && back == id);
+    CHECK(!Exists(dir / "encfs.keyid.cloud"));          // no temp file left behind
+}
+
+void TestSetAsideForRekey() {
+    TempDir dir;
+    const std::string inode(64, 'c');
+    const std::vector<std::string> ours = {"index.enc",   "encfs.kdf",    "encfs.keyid",   "cloud.gen",
+                                           "synced.list", "sync.journal", inode + ".enc", inode + ".0.3.enc"};
+    for (const std::string& name : ours) {
+        WriteText(dir / name, name);
+    }
+    WriteText(dir / ".lock", "");
+    WriteText(dir / "notes.txt", "not ours");
+    ::mkdir((dir / "rekey-not").c_str(), 0700);
+
+    const std::string where = SetAsideForRekey(dir.path(), std::string(32, 'f'));
+    CHECK(!where.empty() && where.find("/rekeyed-ffffffff-") != std::string::npos);
+    for (const std::string& name : ours) {
+        CHECK(!Exists(dir / name));                     // moved...
+        CHECK(ReadText(where + "/" + name) == name);    // ...intact
+    }
+    CHECK(Exists(dir / ".lock") && Exists(dir / "notes.txt") && Exists(dir / "rekey-not"));  // left alone
+
+    // A second set-aside in the same second gets its own directory.
+    WriteText(dir / "index.enc", "again");
+    const std::string second = SetAsideForRekey(dir.path(), std::string(32, 'f'));
+    CHECK(!second.empty() && second != where && ReadText(second + "/index.enc") == "again");
+
+    CHECK(!RekeyInProgress(dir.path()));
+    ::mkdir(RekeyStagingDir(dir.path()).c_str(), 0700);
+    CHECK(RekeyInProgress(dir.path()));
+}
+
+void TestDirLock() {
+    TempDir dir;
+    {
+        auto a = std::make_unique<DirLock>();
+        CHECK(a->Acquire(dir.path()));
+        CHECK(a->Acquire(dir.path()));                  // idempotent
+        DirLock b;
+        CHECK(!b.Acquire(dir.path()));                  // exclusive, even within a process
+
+        // A forked child (a daemonised mount) keeps holding it after the
+        // parent's copy is gone.
+        int to_child[2], to_parent[2];
+        CHECK(::pipe(to_child) == 0 && ::pipe(to_parent) == 0);
+        pid_t pid = ::fork();
+        if (pid == 0) {
+            char c;
+            (void)!::write(to_parent[1], "r", 1);     // ready
+            (void)!::read(to_child[0], &c, 1);        // wait until told to exit
+            ::_exit(0);
+        }
+        char c;
+        CHECK(::read(to_parent[0], &c, 1) == 1);
+        a.reset();                                       // parent's copy closed
+        DirLock c2;
+        CHECK(!c2.Acquire(dir.path()));                  // the child still holds it
+        (void)!::write(to_child[1], "x", 1);
+        int status = 0;
+        ::waitpid(pid, &status, 0);
+        CHECK(c2.Acquire(dir.path()));                   // released when the child exits
+        for (int fd : {to_child[0], to_child[1], to_parent[0], to_parent[1]}) ::close(fd);
+    }
+    DirLock d;
+    CHECK(d.Acquire(dir.path()));                        // released on destruction
+    CHECK(!DirLock().Acquire(dir.path() + "/missing/dir"));
+}
+
 } // namespace
 
 int main() {
@@ -412,5 +515,8 @@ int main() {
         {"Background queue coalesces and drains", TestBackgroundQueueCoalesces},
         {"Failed ops are retried and journaled", TestRetriesAndJournalRecovery},
         {"Encrypt → upload → evict → download → decrypt", TestEndToEndWithoutFuse},
+        {"Key IDs: stable, distinct, files and cloud", TestKeyIds},
+        {"Setting a copy aside after a re-key elsewhere", TestSetAsideForRekey},
+        {"One process per backing directory (DirLock)", TestDirLock},
     });
 }

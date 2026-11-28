@@ -70,6 +70,10 @@ public:
     bool FileExists() const;
     const std::string& path() const { return index_path_; }
 
+    // Point this index at another file and key (used by `encfsctl rekey` to
+    // write a re-encrypted copy). The in-memory contents are unchanged.
+    void Retarget(const std::string& backing_dir, const std::vector<uint8_t>& key);
+
     // Bumped on every save; lets copies of the index be ordered.
     uint64_t generation();
     void set_generation(uint64_t g);

@@ -61,7 +61,8 @@ cleanup() {
 trap cleanup EXIT
 
 blob_ids() { find "$BACK" -maxdepth 1 -name '*.enc' ! -name index.enc -printf '%f\n' | sed 's/\.enc$//' | sort; }
-cloud_ids() { find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name '.*' ! -name index ! -name encfs.kdf -printf '%f\n' | sort; }
+# Data objects in the cloud (not the index, encfs.kdf or the key ID).
+cloud_ids() { find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name '.*' ! -name index ! -name 'encfs.*' -printf '%f\n' | sort; }
 cloud_files() { cloud_ids | cut -c1-64 | sort -u; }  # one inode may span several segment objects
 
 echo "Running FUSE end-to-end tests in $WORK"
@@ -595,9 +596,9 @@ SEG="$WORK/seg"; mkdir -p "$SEG"
 BACK="$SEG/backing"; export ENCFS_STUB_STORE="$SEG/cloud"
 log_mark() { wc -l < "$LOG"; }
 log_since() { tail -n +"$(( $1 + 1 ))" "$LOG"; }
-uploads_since() { log_since "$1" | grep '^Uploaded ' | grep -vc -e ' -> index$' -e ' -> encfs.kdf$'; }
+uploads_since() { log_since "$1" | grep '^Uploaded ' | grep -vc -e ' -> index$' -e ' -> encfs\.'; }
 deletes_since() { log_since "$1" | grep -c '^Deleted '; }
-downloads_since() { log_since "$1" | grep '^Downloaded ' | grep -vc -e '^Downloaded index ' -e '^Downloaded encfs.kdf '; }
+downloads_since() { log_since "$1" | grep '^Downloaded ' | grep -vc -e '^Downloaded index ' -e '^Downloaded encfs\.'; }
 local_objects() { find "$BACK" -maxdepth 1 -name '*.enc' ! -name index.enc | wc -l; }
 
 head -c 18000000 /dev/urandom > "$SEG/src"   # 5 segments: 4 × 4 MiB + 1.2 MB
@@ -687,14 +688,140 @@ head -c 10 /dev/urandom > "$MNT/c"
 check "padded files keep their real size"          [ "$(stat -c %s "$MNT/a")" = 2500 ]
 unmount_fs
 EXTRA_ARGS=()
-pad_sizes=$(find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name index ! -name '.*' -printf '%s\n' | sort -n | uniq | tr '\n' ' ')
+pad_sizes=$(find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name index ! -name '.*' ! -name 'encfs.*' -printf '%s\n' | sort -n | uniq | tr '\n' ' ')
 check "2500 and 4000 bytes look alike in the cloud" \
-    [ "$(find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name index ! -name '.*' -printf '%s\n' | sort -n | uniq -c | awk '$1 == 2' | wc -l)" = 1 ]
+    [ "$(find "$ENCFS_STUB_STORE" -maxdepth 1 -type f ! -name index ! -name '.*' ! -name 'encfs.*' -printf '%s\n' | sort -n | uniq -c | awk '$1 == 2' | wc -l)" = 1 ]
 check "a tiny file is padded to at least 1 KiB"    [ "${pad_sizes%% *}" -gt 1024 ]
 mount_fs || fail "mount (read padded)"
 check "padded files read back at their real size"  [ "$(wc -c < "$MNT/c") $(wc -c < "$MNT/b")" = "10 4000" ]
 unmount_fs
 BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
+
+# ── Re-keying (encfsctl rekey) ──
+MAIN_BACK="$BACK"; MAIN_STORE="$ENCFS_STUB_STORE"; MAIN_KEY="$KEY"
+RK="$WORK/rekey"; mkdir -p "$RK"
+export ENCFS_STUB_STORE="$RK/cloud"
+KEY="$RK/key"; (umask 077 && openssl rand -hex 32 > "$KEY")
+BACK="$RK/A"
+head -c 9000000 /dev/urandom > "$RK/big"
+mount_fs || fail "mount (rekey A)"
+echo "first file" > "$MNT/a.txt"
+cp "$RK/big" "$MNT/big.bin"
+mkdir "$MNT/d"; ln -s ../a.txt "$MNT/d/link"; ln "$MNT/a.txt" "$MNT/d/hard"
+echo secret > "$MNT/private"; chmod 600 "$MNT/private"
+unmount_fs
+# Machine B has a copy (with a key ID); machine C's copy predates key IDs.
+for m in B C D; do
+    BACK="$RK/$m"; mount_fs || fail "mount (rekey $m)"; cat "$MNT/a.txt" >/dev/null; unmount_fs
+done
+rm -f "$RK/C/encfs.keyid" "$RK/D/encfs.keyid"
+BACK="$RK/A"
+OLD_OBJECTS=$(cloud_ids)
+cp "$KEY" "$RK/old.key"
+
+# Only one process per backing directory.
+mount_fs || fail "mount (rekey lock)"
+check_fails "rekey refuses a mounted store"      quiet "$CTL_BIN" rekey -k "$KEY" -c "$STUB" "$BACK"
+mkdir -p "$RK/mnt2"
+check_fails "a second mount of the same backing dir is refused" \
+    quiet "$FS_BIN" -k "$KEY" -c "$STUB" "$RK/mnt2" "$BACK"
+unmount_fs
+
+# Interrupted: uploads fail after everything is staged.
+check_fails "rekey stops when uploads fail" \
+    quiet env ENCFS_STUB_FAIL_UPLOAD=1 "$CTL_BIN" rekey -k "$KEY" -c "$STUB" "$BACK"
+check "...leaving its work staged"               test -d "$BACK/rekey" -a -f "$KEY.new"
+check "...and the old key still current"         cmp -s "$KEY" "$RK/old.key"
+check "...and the cloud untouched"               [ "$(cloud_ids)" = "$OLD_OBJECTS" ]
+check "...still readable from the cloud with the old key" \
+    [ "$("$DECRYPT_BIN" -k "$RK/old.key" -c "$STUB" "$RK/fresh1" a.txt - 2>/dev/null)" = "first file" ]
+check_fails "mounting is refused until it's finished" quiet "$FS_BIN" -k "$KEY" -c "$STUB" "$MNT" "$BACK"
+check "status reports the unfinished re-key"     bash -c "'$CTL_BIN' status -k '$KEY' '$BACK' | grep -q 'Re-key: *unfinished'"
+check "running it again finishes the job"        quiet "$CTL_BIN" rekey -k "$KEY" -c "$STUB" "$BACK"
+check "...and clears the staging area"           test ! -e "$BACK/rekey" -a ! -e "$KEY.new"
+check "the new key replaced the old one"         bash -c "! cmp -s '$KEY' '$RK/old.key'"
+check "...which is kept as <key>.<id>.old"       bash -c "ls '$KEY'.*.old >/dev/null && cmp -s '$KEY'.*.old '$RK/old.key'"
+NEW_OBJECTS=$(cloud_ids)
+check "every object in the cloud was replaced" \
+    test -z "$(comm -12 <(echo "$OLD_OBJECTS") <(echo "$NEW_OBJECTS"))" -a "$(echo "$NEW_OBJECTS" | wc -l)" -ge 4
+check "nothing pending afterwards"               [ ! -s "$BACK/sync.journal" ]
+check_fails "the old key no longer opens the cloud" \
+    quiet "$DECRYPT_BIN" -k "$RK/old.key" -c "$STUB" "$RK/fresh2" a.txt -
+check "the new key restores from the cloud alone" \
+    cmp -s "$RK/big" <("$DECRYPT_BIN" -k "$KEY" -c "$STUB" "$RK/fresh3" big.bin - 2>/dev/null)
+
+mount_fs || fail "mount (after rekey)"
+check "files intact after re-keying"             [ "$(cat "$MNT/a.txt")" = "first file" ]
+check "...including a segmented one"             cmp -s "$RK/big" "$MNT/big.bin"
+check "links and modes intact" \
+    [ "$(readlink "$MNT/d/link") $(stat -c %h "$MNT/a.txt") $(stat -c %a "$MNT/private")" = "../a.txt 2 600" ]
+echo "after" > "$MNT/after.txt"
+unmount_fs
+check_fails "the old key can't mount the re-keyed store" \
+    quiet "$FS_BIN" -k "$RK/old.key" -c "$STUB" "$MNT" "$BACK"
+
+# Machine B, with the new key: sets its old copy aside and restores.
+BACK="$RK/B"; MARK=$(log_mark)
+mount_fs || fail "mount B (new key)"
+check "B detects the re-key"                     bash -c "tail -n +$((MARK + 1)) '$LOG' | grep -q 're-keyed on another machine'"
+check "B reads the re-keyed store"               [ "$(cat "$MNT/after.txt")" = "after" ]
+check "...including the segmented file"          cmp -s "$RK/big" "$MNT/big.bin"
+unmount_fs
+SET_ASIDE=$(find "$RK/B" -maxdepth 1 -name 'rekeyed-*' | head -1)
+check "B's old copy was kept, not deleted"       test -n "$SET_ASIDE" -a -f "$SET_ASIDE/index.enc"
+check "...and still opens with the old key" \
+    [ "$("$DECRYPT_BIN" -k "$RK/old.key" "$SET_ASIDE" a.txt - 2>/dev/null)" = "first file" ]
+
+# Machine C (no key ID yet) still has the old key: told, and its copy set aside.
+KEY="$RK/old.key"; BACK="$RK/C"
+check_fails "C with the old key is refused"      mount_fs
+check "...and told why"                          grep -q "re-keyed on another machine (new key ID" "$LOG"
+KEY="$RK/key"
+mount_fs || fail "mount C (new key)"
+check "C mounts once it has the new key"         [ "$(cat "$MNT/after.txt")" = "after" ]
+unmount_fs
+# Machine D (no key ID yet) goes straight to the new key.
+BACK="$RK/D"
+mount_fs || fail "mount D (new key, pre-key-ID copy)"
+check "a pre-key-ID copy mounts with the new key" [ "$(cat "$MNT/after.txt")" = "after" ]
+unmount_fs
+check "...after setting its old copy aside"      bash -c "ls -d '$RK/D'/rekeyed-* >/dev/null"
+
+# Passphrase stores: the passphrase stays, the key under it changes.
+BACK="$RK/P"; export ENCFS_STUB_STORE="$RK/pcloud"
+quiet env ENCFS_PASSPHRASE=pw "$CTL_BIN" init -p "$BACK"
+pmount pw || fail "mount (passphrase rekey)"
+echo "under a passphrase" > "$MNT/p.txt"
+unmount_fs
+BACK="$RK/Q"; pmount pw || fail "mount Q"; unmount_fs
+cp "$RK/P/encfs.kdf" "$RK/old.kdf"
+BACK="$RK/P"
+check "rekey --passphrase"                       quiet env ENCFS_PASSPHRASE=pw "$CTL_BIN" rekey -p -c "$STUB" "$BACK"
+check "encfs.kdf now wraps a different key"      bash -c "! cmp -s '$RK/P/encfs.kdf' '$RK/old.kdf'"
+pmount pw || fail "mount P after rekey"
+check "same passphrase, files intact"            [ "$(cat "$MNT/p.txt")" = "under a passphrase" ]
+unmount_fs
+mkdir -p "$RK/oldkdf"; cp "$RK/old.kdf" "$RK/oldkdf/encfs.kdf"
+check_fails "the old encfs.kdf can't open the cloud any more" \
+    quiet env ENCFS_PASSPHRASE=pw "$DECRYPT_BIN" -p -c "$STUB" "$RK/oldkdf" p.txt -
+BACK="$RK/Q"
+pmount pw || fail "mount Q after rekey"
+check "another machine follows with the same passphrase" [ "$(cat "$MNT/p.txt")" = "under a passphrase" ]
+unmount_fs
+
+# Old objects that can't be deleted yet are journaled; the next mount finishes.
+BACK="$RK/P"
+P_OBJECTS=$(cloud_ids)
+check "rekey succeeds even if deletes fail" \
+    quiet env ENCFS_STUB_FAIL_DELETE=1 ENCFS_PASSPHRASE=pw "$CTL_BIN" rekey -p -c "$STUB" "$BACK"
+check "...journaling the old objects"            [ "$(grep -c '^D ' "$BACK/sync.journal")" = "$(echo "$P_OBJECTS" | wc -l)" ]
+pmount pw || fail "mount P (finish deletes)"
+check "...which the next mount deletes"          [ "$(cat "$MNT/p.txt")" = "under a passphrase" ]
+unmount_fs
+check "...leaving only the new objects"          [ -z "$(comm -12 <(echo "$P_OBJECTS") <(cloud_ids))" ]
+check "...and an empty journal"                  [ ! -s "$BACK/sync.journal" ]
+
+KEY="$MAIN_KEY"; BACK="$MAIN_BACK"; export ENCFS_STUB_STORE="$MAIN_STORE"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

@@ -1,6 +1,9 @@
 name: Pages
 
 # Publishes web/ (the in-browser demo and recovery tool) to GitHub Pages.
+# Pages has to be switched on once in the repository settings (Settings →
+# Pages → Source: GitHub Actions); until then this workflow skips the deploy
+# with a notice instead of failing.
 on:
   push:
     branches: [ main ]
@@ -17,7 +20,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      enabled: ${{ steps.pages.outputs.enabled }}
+    steps:
+    - id: pages
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if gh api "repos/${GITHUB_REPOSITORY}/pages" --silent 2>/dev/null; then
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          msg="GitHub Pages isn't enabled for this repository, so the web demo wasn't published. Enable it under Settings → Pages → Source: GitHub Actions, then re-run this workflow."
+          echo "::notice title=Pages not enabled::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
   deploy:
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-24.04
     environment:
       name: github-pages

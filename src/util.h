@@ -56,6 +56,25 @@ private:
     bool ok_ = true;
 };
 
+// An exclusive advisory lock on `<dir>/.lock`, so one backing directory is
+// never used by two processes at once (two mounts, or a mount and
+// `encfsctl rekey`). Held until the object is destroyed or the process
+// exits; a forked child (e.g. a daemonised mount) keeps holding it. The
+// descriptor is close-on-exec, so cloudcli children don't inherit it.
+class DirLock {
+public:
+    DirLock() = default;
+    ~DirLock();
+    DirLock(const DirLock&) = delete;
+    DirLock& operator=(const DirLock&) = delete;
+
+    // False if another process holds the lock (or it can't be taken).
+    bool Acquire(const std::string& dir);
+
+private:
+    int fd_ = -1;
+};
+
 // Overwrite a buffer with zeros in a way the optimiser can't elide.
 void SecureWipe(std::vector<uint8_t>& buf);
 void SecureWipe(std::string& buf);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(encfs-cloudcli VERSION 3.2.0 LANGUAGES CXX)
+project(encfs-cloudcli VERSION 3.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,6 +56,7 @@ add_library(encfs_core STATIC
     src/file_contents.cpp
     src/index_sync.cpp
     src/segments.cpp
+    src/rekey.cpp
     src/key_setup.cpp
     src/cloudcli_wrapper.cpp
 )
@@ -105,7 +106,8 @@ if(ENCFS_E2E)
                      $<TARGET_FILE:decrypt_by_name>
                      $<TARGET_FILE:encfsctl>
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/cloudcli_stub)
-    set_tests_properties(test_e2e_fuse PROPERTIES TIMEOUT 120)
+    # ~2 min in Release, longer under sanitizers on shared runners.
+    set_tests_properties(test_e2e_fuse PROPERTIES TIMEOUT 600)
 endif()
 
 # Cross-check web/encfs.js (the browser implementation) against the C++ code.

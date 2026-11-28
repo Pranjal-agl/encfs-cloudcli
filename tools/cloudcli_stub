@@ -6,7 +6,9 @@
 #   cloudcli_stub delete   <remote_id>
 #
 # Storage: $ENCFS_STUB_STORE (default ~/.encfs_stub_store).
-# Set ENCFS_STUB_FAIL=1 to make every command fail (for testing retries).
+# Set ENCFS_STUB_FAIL=1 to make every command fail (for testing retries), or
+# ENCFS_STUB_FAIL_UPLOAD=1 / ENCFS_STUB_FAIL_DELETE=1 to make only uploads /
+# deletes fail.
 
 set -euo pipefail
 
@@ -25,6 +27,7 @@ check_id() {
 
 case "${1:-}" in
     upload)
+        [ "${ENCFS_STUB_FAIL_UPLOAD:-0}" = "1" ] && die "simulated upload failure"
         [ $# -eq 2 ] || die "usage: upload <local_path>"
         [ -f "$2" ] || die "file not found: $2"
         remote_id=$(basename "$2" .enc)
@@ -42,6 +45,7 @@ case "${1:-}" in
         echo "Downloaded $2 -> $3"
         ;;
     delete)
+        [ "${ENCFS_STUB_FAIL_DELETE:-0}" = "1" ] && die "simulated delete failure"
         [ $# -eq 2 ] || die "usage: delete <remote_id>"
         check_id "$2"
         rm -f "$STORE_DIR/$2"

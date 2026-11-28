@@ -32,6 +32,7 @@
 #include "file_contents.h"
 #include "index.h"
 #include "index_sync.h"
+#include "rekey.h"
 #include "segments.h"
 #include "key_setup.h"
 #include "util.h"
@@ -817,11 +818,6 @@ CloudCLIWrapper::PreUpload BeforeUpload(const std::string& id, std::string& path
 
 enum class Prefer { kNone, kCloud, kLocal };
 
-bool JournalHasWork(const std::string& backing_dir) {
-    struct stat st;
-    return ::stat((backing_dir + "/sync.journal").c_str(), &st) == 0 && st.st_size > 0;
-}
-
 // At mount, before anything is queued: bring the local index in line with the
 // cloud's (see index_sync.h). Returns 0, or an exit status to refuse the mount.
 int ReconcileIndexAtMount(Context& ctx, bool restored, bool fresh, Prefer prefer) {
@@ -854,8 +850,9 @@ int ReconcileIndexAtMount(Context& ctx, bool restored, bool fresh, Prefer prefer
     if (status == CloudIndexStatus::kUnreadable) {
         if (prefer != Prefer::kLocal) {
             std::cerr << "Error: the cloud's index can't be decrypted with this key (it was "
-                         "replaced, or is corrupt). Mount with --prefer-local to overwrite it "
-                         "with this machine's copy.\n";
+                         "replaced, or is corrupt). If `encfsctl rekey` is running on another "
+                         "machine, wait for it to finish and mount again. Otherwise, mount with "
+                         "--prefer-local to overwrite it with this machine's copy.\n";
             return 1;
         }
         ctx.force_index_upload = true;
@@ -1631,16 +1628,6 @@ bool LocalFileExists(const std::string& path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
-// Download a cloud object to `path` atomically (temp file + rename).
-bool FetchFromCloud(CloudCLIWrapper& cloud, const std::string& remote_id, const std::string& path) {
-    const std::string tmp = path + ".download";
-    if (cloud.Download(remote_id, tmp) && ::rename(tmp.c_str(), path.c_str()) == 0) {
-        return true;
-    }
-    ::unlink(tmp.c_str());
-    return false;
-}
-
 void PrintUsage(const char* prog) {
     std::cout <<
         "Usage: " << prog << " [options] <mountpoint> <backing_dir> [-- <fuse options>]\n"
@@ -1746,6 +1733,20 @@ int main(int argc, char* argv[]) {
     }
     ::chmod(backing_dir.c_str(), 0700);
 
+    // One process per backing directory. Held for the life of the mount
+    // (a daemonised child inherits it).
+    static DirLock dir_lock;
+    if (!dir_lock.Acquire(backing_dir)) {
+        std::cerr << "Error: " << backing_dir << " is already in use (mounted elsewhere, or being "
+                     "re-keyed by encfsctl)\n";
+        return 1;
+    }
+    if (RekeyInProgress(backing_dir)) {
+        std::cerr << "Error: a re-key of this store (encfsctl rekey) is unfinished. Run it again to "
+                     "finish before mounting.\n";
+        return 1;
+    }
+
     // A new machine (or a lost backing directory): fetch the index, and the
     // passphrase KDF parameters if needed, from the cloud before checking the key.
     CloudCLIWrapper bootstrap(cloudcli_cmd);
@@ -1753,6 +1754,28 @@ int main(int argc, char* argv[]) {
     const std::string kdf_path = backing_dir + "/encfs.kdf";
     bool fresh_index = false;
     bool restored_index = false;
+
+    // Re-keyed on another machine (see rekey.h)? Then this machine's copy is
+    // under the old key: move it aside, intact, and restore from the cloud.
+    std::string cloud_kid, local_kid;
+    const bool have_cloud_kid = FetchCloudKeyId(bootstrap, backing_dir, &cloud_kid);
+    const bool have_local_kid = ReadKeyId(KeyIdPath(backing_dir), &local_kid);
+    bool rekeyed_elsewhere = false;
+    auto set_aside = [&](const std::string& old_id) {
+        const std::string where = SetAsideForRekey(backing_dir, old_id);
+        if (where.empty()) {
+            std::cerr << "Error: cannot move this machine's old copy of the store aside\n";
+            return false;
+        }
+        rekeyed_elsewhere = true;
+        std::cerr << "[encfs] this store was re-keyed on another machine. This machine's old copy "
+                     "(still readable with the old key) is now in " << where << "\n";
+        return true;
+    };
+    if (have_cloud_kid && have_local_kid && cloud_kid != local_kid && LocalFileExists(index_path)) {
+        if (!set_aside(local_kid)) return 1;
+    }
+
     if (!LocalFileExists(index_path)) {
         if (FetchFromCloud(bootstrap, kCloudIndexId, index_path)) {
             restored_index = true;
@@ -1769,10 +1792,58 @@ int main(int argc, char* argv[]) {
 
     std::vector<uint8_t> master_key;
     std::string error;
-    if (!ResolveMasterKey(key_options, backing_dir, /*allow_create=*/true, master_key, error)) {
+    bool resolved = ResolveMasterKey(key_options, backing_dir, /*allow_create=*/true, master_key, error);
+    if (!resolved && have_cloud_kid && !have_local_kid && !rekeyed_elsewhere && !key_options.use_passphrase &&
+        LocalFileExists(index_path)) {
+        // A copy from before key IDs existed, re-keyed elsewhere, mounted
+        // with the new key file: the key matches the cloud, not this copy.
+        std::vector<uint8_t> candidate;
+        try {
+            candidate = KeyManager::LoadKeyFromFile(key_options.key_path.empty() ? DefaultKeyPath()
+                                                                                 : key_options.key_path);
+        } catch (const std::exception&) {
+        }
+        if (!candidate.empty() && KeyId(candidate) == cloud_kid) {
+            if (!set_aside("00000000")) return 1;
+            if (FetchFromCloud(bootstrap, kCloudIndexId, index_path)) {
+                restored_index = true;
+                fresh_index = false;
+            }
+            resolved = ResolveMasterKey(key_options, backing_dir, /*allow_create=*/true, master_key, error);
+        }
+        SecureWipe(candidate);
+    }
+    if (!resolved) {
         std::cerr << "Error: " << error << "\n";
+        if (rekeyed_elsewhere) {
+            std::cerr << "This store was re-keyed on another machine: mount with the new "
+                      << (key_options.use_passphrase ? "passphrase (the one in use when it was re-keyed)"
+                                                     : "key file")
+                      << ".\n";
+        }
         return 1;
     }
+    const std::string our_kid = KeyId(master_key);
+    if (have_cloud_kid && cloud_kid != our_kid && !fresh_index && !restored_index) {
+        uint64_t cloud_gen = 0;
+        if (FetchCloudIndex(bootstrap, master_key, backing_dir, &cloud_gen) == CloudIndexStatus::kUnreadable) {
+            // Our key opens our copy but not the cloud's, whose key ID says
+            // it was re-keyed: we hold the old key.
+            if (!set_aside(our_kid)) return 1;
+            std::cerr << "Error: this store was re-keyed on another machine (new key ID "
+                      << cloud_kid.substr(0, 8) << "; this key is " << our_kid.substr(0, 8)
+                      << "). Mount again with the new "
+                      << (key_options.use_passphrase ? "settings (fetched from the cloud) and the passphrase "
+                                                       "that was in use when it was re-keyed"
+                                                     : "key file")
+                      << ".\n";
+            return 1;
+        }
+        // The cloud's index opens with our key, so its key ID is stale or
+        // bogus: ours replaces it below.
+    }
+    WriteKeyId(KeyIdPath(backing_dir), our_kid);
+    const bool upload_kid = !have_cloud_kid || cloud_kid != our_kid;
 
     auto ctx = std::make_unique<Context>();
     ctx->backing_dir = backing_dir;
@@ -1816,6 +1887,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[encfs] resuming " << resumed << " unfinished cloud operation(s)\n";
     }
     if (kdf_pending) ctx->cloud->QueueUpload(kdf_path);
+    if (upload_kid) ctx->cloud->QueueUpload(KeyIdPath(backing_dir));
     g_ctx = ctx.get();
     CleanBackingDir();
     ctx->cloud->SetPreUploadHook(BeforeUpload);
