@@ -23,7 +23,7 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — a key file, or a passphrase that wraps a random master key (PBKDF2-HMAC-SHA256, 600k iterations). The passphrase can be changed without re-encrypting anything.
-- **Directories** — `mkdir -p`, nested files, directory renames, `rm -r`, with every path name kept private
+- **A real POSIX namespace** — directories, hard links, symbolic links and stored permission bits. Renames, including whole directories and `RENAME_EXCHANGE`, are atomic and instant because they only touch the index.
 - **Works with everyday tools** — append, partial overwrite, truncate, `mv`, `touch`, `cp -rp`, `tar`, `rsync -a`, `find`, `df`
 
 ---
@@ -84,7 +84,7 @@ Everything is derived from one 32-byte master key with HMAC-SHA256, so the maste
 
 | Key | Derivation | Used for |
 |---|---|---|
-| filename key | `HMAC(master, "encfs_filename_hmac")` | remote ID = `HMAC(filename key, name)` |
+| filename key | `HMAC(master, "encfs_filename_hmac")` | remote IDs of files created before v3.0 (new files get random IDs) |
 | index key | `HMAC(master, "encfs_index_key_derivation")` | encrypting `index.enc` |
 | content key | `HMAC(master, "encfs_content_key_v2")` | parent of the per-file keys |
 | per-file key | `HMAC(content key, "encfs-v2-chunk-key" ‖ salt)` | encrypting one blob |
@@ -108,7 +108,13 @@ Blobs written by v1 are still readable and are rewritten as v2 the next time the
 
 ### Index format
 
-`index.enc` holds, per entry: plaintext path (e.g. `docs/notes.txt`), remote ID, version counter, size and mtime. Directories are entries with an empty remote ID, so they need no blob and the format is unchanged from v1. It is serialized little-endian, then encrypted with AES-256-GCM under the index key. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
+`index.enc` maps paths (e.g. `docs/notes.txt`) to **inodes**.
+
+- **Inode fields:** an ID, a type (file, directory or symlink), a version counter, size, mtime, permission bits, and a symlink target.
+- **Where data lives:** a file inode's ID is also the name of its blob. New inodes get **random** IDs, so a blob's name says nothing about its path, and renaming never touches data.
+- **Hard links** are several paths pointing to one inode.
+- **Generation counter:** the index carries one, incremented on every save.
+- **Encoding:** it is serialized little-endian as format `EIX2`, then encrypted with AES-256-GCM under the index key. Indexes written by v1 and v2 are read and converted on the next save. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
 
 ### Restoring on a new machine
 
@@ -272,17 +278,14 @@ CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan bu
 - Keep the key file at mode `0600`; the tools warn if it's readable by others.
 - Plaintext filenames and contents never appear in cloud storage or the backing directory.
 - What *is* visible to the cloud: the number of files, their approximate sizes, and when they change.
-- Remote IDs are deterministic per path, so re-creating a deleted file at the same path reuses its remote ID. This is what lets you recover a file by its path without the index.
+- New files get random IDs. Nothing in the cloud relates to a path, so re-creating a file under the same name, or renaming one, is invisible to the cloud. Files created before v3.0 keep their old path-derived IDs, which are still opaque.
 - Key material and decrypted buffers are wiped (`OPENSSL_cleanse`) when no longer needed.
 
 ## Limitations
 
-- **Directory operations scale with the tree**: listing a directory scans the whole index. Renaming a directory re-encrypts every file below it, because remote IDs are derived from full paths. Both are fine for thousands of files, but not millions.
-- **No symlinks or hard links.**
 - **Each save rewrites the whole blob**: memory stays constant, but CPU and disk time are proportional to file size, and `cloudcli` uploads the whole blob. Small edits to very large files are therefore slow to sync.
 - **Single writer**: don't mount the same cloud store from two machines at once. Each machine's index would overwrite the other's.
-- **Permissions aren't stored**: everything belongs to the mounting user. `chmod`/`chown` are accepted but ignored.
-- **Rename isn't atomic across a crash**: it re-encrypts the file under the new name's ID before removing the old one, so a crash mid-rename can leave both copies.
+- **Ownership isn't stored**: everything belongs to the mounting user. Permission bits are stored and enforced (`default_permissions`). `chown` is accepted and ignored, so `rsync -a` and `cp -p` work.
 
 ### Upgrading from v1
 
@@ -298,6 +301,15 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 ---
 
 ## Changelog
+
+### v3.0 — inodes
+
+- **The index maps paths to inodes** (format `EIX2`). New files get random IDs, unrelated to their path.
+- **Renames only touch the index.** That makes them instant and atomic, including whole directory trees and `RENAME_EXCHANGE`. Before, renaming a directory re-encrypted every file under it, and a crash mid-rename could leave both copies.
+- **New POSIX features:** hard links (`link`, shared `st_ino`, `nlink`), symbolic links (`symlink`, `readlink`), and stored permission bits enforced with `default_permissions`.
+- `readdir` and `rmdir` use a per-directory child list instead of scanning the whole index.
+- `decrypt_by_name --extract-all` recreates symlinks, hard links and modes. `encfsctl status` and the browser recovery tool understand the new types.
+- **Compatibility:** stores created by earlier versions open unchanged; their indexes are converted on the first save. Indexes written by v3.0 can't be read by earlier versions.
 
 ### v2.10 — key management
 

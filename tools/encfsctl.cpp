@@ -170,12 +170,14 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
         return 1;
     }
 
-    uint64_t files = 0, dirs = 0, bytes = 0, cached = 0, cached_bytes = 0;
-    for (const auto& name : index.GetAllPlaintextNames()) {
-        FileMetadata m;
-        index.GetMetadata(name, m);
+    uint64_t files = 0, dirs = 0, links = 0, bytes = 0, cached = 0, cached_bytes = 0;
+    for (const FileMetadata& m : index.AllInodes()) {
         if (m.IsDirectory()) {
             ++dirs;
+            continue;
+        }
+        if (m.IsSymlink()) {
+            ++links;
             continue;
         }
         ++files;
@@ -199,7 +201,8 @@ int Status(const KeyOptions& opts, const std::string& backing_dir) {
     const bool has_synced = Exists(backing_dir + "/synced.list");
 
     std::cout << "Store:          " << backing_dir << "\n"
-              << "Files:          " << files << " in " << dirs << " directories, " << HumanBytes(bytes) << "\n"
+              << "Files:          " << files << " in " << dirs << " directories, " << HumanBytes(bytes)
+              << (links ? ", plus " + std::to_string(links) + " symbolic link(s)" : std::string()) << "\n"
               << "Cached locally: " << cached << " of " << files << " blobs, " << HumanBytes(cached_bytes)
               << (cached < files ? " (the rest are fetched from the cloud when opened)" : "") << "\n"
               << "Pending sync:   " << pending << " operation(s)"

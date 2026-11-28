@@ -385,6 +385,67 @@ check "all stress files intact after remount" [ "$STRESS_OK" = 1 ]
 rm -r "$MNT/stress"
 unmount_fs
 
+# ── Inodes: hard links, symlinks, modes, index-only renames ──
+mount_fs || fail "mount for inode tests"
+mkdir -p "$MNT/ino/sub"
+echo "shared" > "$MNT/ino/orig"
+ln "$MNT/ino/orig" "$MNT/ino/sub/hard"
+check "hard link reads the same data"    [ "$(cat "$MNT/ino/sub/hard")" = "shared" ]
+check "link count is 2"                  [ "$(stat -c %h "$MNT/ino/orig")" = 2 ]
+check "hard links share an inode number" [ "$(stat -c %i "$MNT/ino/orig")" = "$(stat -c %i "$MNT/ino/sub/hard")" ]
+echo "edited via link" >> "$MNT/ino/sub/hard"
+check "write via one name shows in other" [ "$(tail -1 "$MNT/ino/orig")" = "edited via link" ]
+rm "$MNT/ino/orig"
+check "data survives unlinking one name" [ "$(head -1 "$MNT/ino/sub/hard")" = "shared" ]
+check "link count back to 1"             [ "$(stat -c %h "$MNT/ino/sub/hard")" = 1 ]
+
+ln -s sub/hard "$MNT/ino/sym"
+check "symlink resolves"                 [ "$(head -1 "$MNT/ino/sym")" = "shared" ]
+check "readlink returns the target"      [ "$(readlink "$MNT/ino/sym")" = "sub/hard" ]
+check "lstat sees a symlink"             [ -L "$MNT/ino/sym" ]
+
+echo "#!/bin/sh" > "$MNT/ino/run.sh"
+chmod 750 "$MNT/ino/run.sh"
+check "chmod is stored"                  [ "$(stat -c %a "$MNT/ino/run.sh")" = 750 ]
+
+# Exchange two paths atomically (renameat2 RENAME_EXCHANGE).
+echo "A" > "$MNT/ino/a"; echo "B" > "$MNT/ino/b"
+python3 - "$MNT/ino/a" "$MNT/ino/b" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+AT_FDCWD, RENAME_EXCHANGE = -100, 2
+if libc.renameat2(AT_FDCWD, sys.argv[1].encode(), AT_FDCWD, sys.argv[2].encode(), RENAME_EXCHANGE):
+    sys.exit(os.strerror(ctypes.get_errno()))
+PY
+check "RENAME_EXCHANGE swaps"            [ "$(cat "$MNT/ino/a")$(cat "$MNT/ino/b")" = "BA" ]
+
+# A directory rename is index-only: not one blob is rewritten.
+for i in $(seq 20); do head -c 50000 /dev/urandom > "$MNT/ino/sub/f$i"; done
+cp "$MNT/ino/sub/f7" "$WORK/ino_f7"
+unmount_fs
+BEFORE=$(cd "$BACK" && find . -name '*.enc' ! -name index.enc -printf '%f %s %T@\n' | sort | md5sum)
+mount_fs || fail "remount for rename"
+T0=$(date +%s.%N); mv "$MNT/ino/sub" "$MNT/ino/moved"; T1=$(date +%s.%N)
+unmount_fs
+AFTER=$(cd "$BACK" && find . -name '*.enc' ! -name index.enc -printf '%f %s %T@\n' | sort | md5sum)
+check "directory rename rewrote no blobs" [ "$BEFORE" = "$AFTER" ]
+check "...and was quick"                  [ "$(echo "$T1 - $T0 < 1" | bc)" = 1 ]
+mount_fs || fail "remount after rename"
+check "renamed tree persists"            cmp -s "$WORK/ino_f7" "$MNT/ino/moved/f7"
+check "symlink still dangles correctly"  [ "$(readlink "$MNT/ino/sym")" = "sub/hard" ]
+check "mode persists across remount"     [ "$(stat -c %a "$MNT/ino/run.sh")" = 750 ]
+check "hard link persists"               [ "$(head -1 "$MNT/ino/moved/hard")" = "shared" ]
+ln "$MNT/ino/moved/hard" "$MNT/ino/hard2"
+unmount_fs
+
+"$DECRYPT_BIN" -k "$KEY" -c "$STUB" --extract-all "$WORK/ino_export" "$BACK" >/dev/null 2>&1
+check "export recreates symlinks"        [ "$(readlink "$WORK/ino_export/ino/sym")" = "sub/hard" ]
+check "export recreates hard links"      [ "$(stat -c %i "$WORK/ino_export/ino/hard2")" = "$(stat -c %i "$WORK/ino_export/ino/moved/hard")" ]
+check "export restores modes"            [ "$(stat -c %a "$WORK/ino_export/ino/run.sh")" = 750 ]
+mount_fs || fail "mount to clean up"
+rm -r "$MNT/ino"
+unmount_fs
+
 # ── encfsctl: init, passphrase changes, status ──
 CTL_WORK="$WORK/ctl"; mkdir -p "$CTL_WORK"
 check "init creates a key file"            quiet "$CTL_BIN" init -k "$CTL_WORK/new.key" "$CTL_WORK/keyed"

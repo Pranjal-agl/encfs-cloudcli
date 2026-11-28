@@ -135,46 +135,86 @@ export async function decryptIndex(keys, bytes) {
   return parseIndex(plain);
 }
 
+// Index v2: "EIX2" | generation:u64 | inodes | paths (see src/index.h).
+// Index v1: count | (name | id | version | size | mtime)* ; empty id = directory.
+// Returns one entry per path: { name, remoteId, type, isDirectory, isSymlink,
+// version, size, mtime, mode, target, nlink }.
 export function parseIndex(plain) {
   let pos = 0;
   const need = (n) => { if (plain.length - pos < n) throw new Error("malformed index"); };
-  need(4);
-  const count = getU32(plain, 0);
-  pos = 4;
+  const u8 = () => { need(1); return plain[pos++]; };
+  const u32 = () => { need(4); const v = getU32(plain, pos); pos += 4; return v; };
+  const u64 = () => { need(8); const v = getU64(plain, pos); pos += 8; return v; };
+  const str = () => { const n = u32(); need(n); const v = dec.decode(plain.slice(pos, pos + n)); pos += n; return v; };
+  const TYPES = { 1: "file", 2: "directory", 3: "symlink" };
+  const entry = (name, inode, nlink) => ({
+    name, ...inode, nlink,
+    isDirectory: inode.type === "directory", isSymlink: inode.type === "symlink",
+  });
+
+  if (plain.length >= 4 && dec.decode(plain.slice(0, 4)) === "EIX2") {
+    pos = 4;
+    const generation = u64();
+    const inodes = new Map();
+    for (let i = 0, n = u32(); i < n; i++) {
+      const remoteId = str();
+      const type = TYPES[u8()];
+      if (!type) throw new Error("malformed index (bad type)");
+      const version = u64(), size = Number(u64()), mtime = Number(BigInt.asIntN(64, u64()));
+      const mode = u32() & 0o7777, target = str();
+      inodes.set(remoteId, { remoteId, type, version, size, mtime, mode, target });
+    }
+    const paths = [];
+    for (let i = 0, n = u32(); i < n; i++) {
+      const name = str(), id = str();
+      if (!inodes.has(id)) throw new Error("malformed index (dangling path)");
+      paths.push([name, id]);
+    }
+    if (pos !== plain.length) throw new Error("malformed index (trailing data)");
+    const links = new Map();
+    for (const [, id] of paths) links.set(id, (links.get(id) || 0) + 1);
+    const entries = paths.map(([name, id]) => entry(name, inodes.get(id), links.get(id)));
+    entries.generation = generation;
+    return entries;
+  }
+
   const entries = [];
-  for (let i = 0; i < count; i++) {
-    need(4); const nameLen = getU32(plain, pos); pos += 4;
-    need(nameLen); const name = dec.decode(plain.slice(pos, pos + nameLen)); pos += nameLen;
-    need(4); const idLen = getU32(plain, pos); pos += 4;
-    need(idLen); const remoteId = dec.decode(plain.slice(pos, pos + idLen)); pos += idLen;
-    need(24);
-    entries.push({
-      name, remoteId,
-      version: getU64(plain, pos),
-      size: Number(getU64(plain, pos + 8)),
-      mtime: Number(getI64(plain, pos + 16)),
-      isDirectory: remoteId === "",
-    });
-    pos += 24;
+  for (let i = 0, n = u32(); i < n; i++) {
+    const name = str(), remoteId = str();
+    const version = u64(), size = Number(u64()), mtime = Number(BigInt.asIntN(64, u64()));
+    const type = remoteId === "" ? "directory" : "file";
+    entries.push(entry(name, { remoteId, type, version, size, mtime,
+                               mode: type === "directory" ? 0o755 : 0o644, target: "" }, 1));
   }
   if (pos !== plain.length) throw new Error("malformed index (trailing data)");
   return entries;
 }
 
-export function serializeIndex(entries) {
-  const parts = [u32le(entries.length)];
+// Write index v2 from path entries (entries sharing a remoteId are hard links).
+export function serializeIndex(entries, generation = 1) {
+  const TYPE = { file: 1, directory: 2, symlink: 3 };
+  const str = (v) => { const b = enc.encode(v); return [u32le(b.length), b]; };
+  const inodes = new Map();
   for (const e of entries) {
-    const name = enc.encode(e.name), id = enc.encode(e.remoteId);
-    parts.push(u32le(name.length), name, u32le(id.length), id,
-               u64le(e.version), u64le(e.size), u64le(BigInt.asUintN(64, BigInt(e.mtime))));
+    const remoteId = e.remoteId || toHex(randomBytes(32));
+    e.remoteId = remoteId;
+    if (!inodes.has(remoteId)) inodes.set(remoteId, e);
   }
+  const parts = [enc.encode("EIX2"), u64le(generation), u32le(inodes.size)];
+  for (const [id, e] of inodes) {
+    parts.push(...str(id), new Uint8Array([TYPE[e.type || "file"]]), u64le(e.version ?? 1),
+               u64le(e.size ?? 0), u64le(BigInt.asUintN(64, BigInt(e.mtime ?? 0))),
+               u32le(e.mode ?? 0o644), ...str(e.target ?? ""));
+  }
+  parts.push(u32le(entries.length));
+  for (const e of entries) parts.push(...str(e.name), ...str(e.remoteId));
   return concat(...parts);
 }
 
-export async function encryptIndex(keys, entries) {
+export async function encryptIndex(keys, entries, generation = 1) {
   const nonce = randomBytes(12);
   const key = await aesKey(keys.index, "encrypt");
-  return concat(nonce, await gcmEncrypt(key, nonce, new Uint8Array(), serializeIndex(entries)));
+  return concat(nonce, await gcmEncrypt(key, nonce, new Uint8Array(), serializeIndex(entries, generation)));
 }
 
 // ── Blob format v2 ──────────────────────────────────────────────────────────
