@@ -106,7 +106,8 @@ if(ENCFS_E2E)
                      $<TARGET_FILE:decrypt_by_name>
                      $<TARGET_FILE:encfsctl>
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/cloudcli_stub)
-    set_tests_properties(test_e2e_fuse PROPERTIES TIMEOUT 120)
+    # ~2 min in Release, longer under sanitizers on shared runners.
+    set_tests_properties(test_e2e_fuse PROPERTIES TIMEOUT 600)
 endif()
 
 # Cross-check web/encfs.js (the browser implementation) against the C++ code.
