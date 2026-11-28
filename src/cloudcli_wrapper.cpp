@@ -144,26 +144,53 @@ void CloudCLIWrapper::WorkerLoop() {
         // Find the first queued ID whose back-off has elapsed.
         auto now = Clock::now();
         auto earliest = Clock::time_point::max();
-        // The index goes last: it must never reach the cloud before the
-        // blobs it refers to.
+        // Order matters for anyone restoring from the cloud:
+        //   1. uploads of data objects,
+        //   2. then the index that refers to them,
+        //   3. then deletes, and only once no index upload is queued, in
+        //      flight or journaled — an object may only disappear after the
+        //      cloud's index has stopped referring to it.
+        auto tier = [](const std::string& id, const Op& op) {
+            if (op.kind == Op::kDelete) return 3;
+            return id == "index" ? 2 : 1;
+        };
+        int best_tier = 4;
+        bool lower_tier_waiting[4] = {false, false, false, false};
         auto ready = order_.end();
-        auto ready_index = order_.end();
         for (auto it = order_.begin(); it != order_.end(); ++it) {
             auto p = pending_.find(*it);
-            if (p == pending_.end() || p->second.not_before <= now) {
-                if (*it != "index") {
-                    ready = it;
-                    break;
-                }
-                if (ready_index == order_.end()) ready_index = it;
+            if (p == pending_.end()) continue;
+            const int t = tier(*it, p->second);
+            lower_tier_waiting[t] = true;
+            if (p->second.not_before > now) {
+                earliest = std::min(earliest, p->second.not_before);
                 continue;
             }
-            earliest = std::min(earliest, p->second.not_before);
+            if (t < best_tier) {
+                best_tier = t;
+                ready = it;
+            }
         }
-        if (ready == order_.end()) {
-            bool others_waiting = false;
-            for (const auto& id : order_) others_waiting |= (id != "index");
-            if (!others_waiting) ready = ready_index;
+        if (ready != order_.end()) {
+            const bool index_blocked = best_tier == 2 && lower_tier_waiting[1];
+            const bool index_outstanding = pending_.count("index") || failed_.count("index") ||
+                                           (in_flight_ && in_flight_id_ == "index");
+            const bool delete_blocked =
+                best_tier == 3 && (lower_tier_waiting[1] || lower_tier_waiting[2] || index_outstanding);
+            if (index_blocked || delete_blocked) ready = order_.end();
+        }
+        if (ready == order_.end() && earliest == Clock::time_point::max() && !order_.empty() &&
+            failed_.count("index")) {
+            // Only deletes left, held back by an index upload that failed for
+            // this session: they stay journaled for the next mount.
+            for (const auto& id : order_) {
+                auto p = pending_.find(id);
+                if (p != pending_.end()) failed_[id] = p->second;
+            }
+            pending_.clear();
+            order_.clear();
+            WriteJournalLocked();
+            continue;
         }
 
         if (ready == order_.end()) {
@@ -206,7 +233,13 @@ void CloudCLIWrapper::WorkerLoop() {
             lock.lock();
         }
 
-        if (verdict == PreUpload::kAbort) {
+        // The file was removed while we uploaded it (superseded by a newer
+        // version): nothing is left to upload, so this isn't a failure.
+        const bool vanished = !ok && op.kind == Op::kUpload && verdict == PreUpload::kProceed &&
+                              !FileExists(run_op.local_path);
+        if (vanished) {
+            // Nothing to retry; any delete for it is already queued.
+        } else if (verdict == PreUpload::kAbort) {
             // Vetoed (e.g. a conflicting index in the cloud): no retries this
             // session, but keep it in the journal.
             if (pending_.count(remote_id) == 0) failed_[remote_id] = op;

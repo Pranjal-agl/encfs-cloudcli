@@ -13,6 +13,8 @@ namespace {
 constexpr uint32_t kMaxNameLen = 1024 * 1024;
 constexpr uint32_t kMaxIdLen = 1024;
 const uint8_t kMagicV2[4] = {'E', 'I', 'X', '2'};
+const uint8_t kMagicV3[4] = {'E', 'I', 'X', '3'};
+constexpr uint32_t kMaxSegments = 1u << 24;
 
 std::string ParentOf(const std::string& path) {
     auto slash = path.find_last_of('/');
@@ -104,7 +106,7 @@ void EncryptedIndex::Relink(State& s) {
 // ── Serialization ───────────────────────────────────────────────────────────
 
 std::vector<uint8_t> EncryptedIndex::SerializeLocked() const {
-    std::vector<uint8_t> out(kMagicV2, kMagicV2 + 4);
+    std::vector<uint8_t> out(kMagicV3, kMagicV3 + 4);
     AppendU64LE(out, state_.generation);
     AppendU32LE(out, static_cast<uint32_t>(state_.inodes.size()));
     for (const auto& [id, m] : state_.inodes) {
@@ -115,6 +117,10 @@ std::vector<uint8_t> EncryptedIndex::SerializeLocked() const {
         AppendU64LE(out, static_cast<uint64_t>(m.mtime));
         AppendU32LE(out, m.mode);
         AppendString(out, m.target);
+        AppendU32LE(out, m.segment_size);
+        AppendU32LE(out, m.chunk_size);
+        AppendU32LE(out, static_cast<uint32_t>(m.segments.size()));
+        for (uint64_t v : m.segments) AppendU64LE(out, v);
     }
     AppendU32LE(out, static_cast<uint32_t>(state_.paths.size()));
     for (const auto& [path, id] : state_.paths) {
@@ -125,7 +131,9 @@ std::vector<uint8_t> EncryptedIndex::SerializeLocked() const {
 }
 
 bool EncryptedIndex::Deserialize(const std::vector<uint8_t>& data, State& out) {
-    if (data.size() < 4 || std::memcmp(data.data(), kMagicV2, 4) != 0) return DeserializeV1(data, out);
+    const bool v3 = data.size() >= 4 && std::memcmp(data.data(), kMagicV3, 4) == 0;
+    const bool v2 = data.size() >= 4 && std::memcmp(data.data(), kMagicV2, 4) == 0;
+    if (!v2 && !v3) return DeserializeV1(data, out);
 
     Reader r{data};
     r.pos = 4;
@@ -143,6 +151,21 @@ bool EncryptedIndex::Deserialize(const std::vector<uint8_t>& data, State& out) {
         m.mtime = static_cast<int64_t>(r.U64());
         m.mode = r.U32() & 07777;
         m.target = r.Str(kMaxNameLen);
+        if (v3) {
+            m.segment_size = r.U32();
+            m.chunk_size = r.U32();
+            const uint32_t n = r.U32();
+            // A segmented layout has both a size and at least one segment,
+            // and only files have one.
+            if (n > kMaxSegments || (n > 0) != (m.segment_size > 0)) return false;
+            if (n > 0 && !m.IsFile()) return false;
+            // Segments are whole chunks.
+            if (n > 0 && (m.chunk_size == 0 || m.chunk_size > ChunkedCrypto::MAX_CHUNK_SIZE ||
+                          m.segment_size % m.chunk_size != 0)) {
+                return false;
+            }
+            for (uint32_t k = 0; k < n && r.ok; ++k) m.segments.push_back(r.U64());
+        }
         m.nlink = 0;
         if (!r.ok || s.inodes.count(m.remote_id)) return false;
         s.inodes[m.remote_id] = m;

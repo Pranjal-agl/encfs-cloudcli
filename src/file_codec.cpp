@@ -48,6 +48,12 @@ std::vector<uint8_t> FileCodec::Encrypt(const std::vector<uint8_t>& plaintext,
     return ChunkedCrypto::Encrypt(plaintext, content_key_, chunk_size_, Aad(remote_id, version));
 }
 
+std::vector<uint8_t> FileCodec::EncryptSegment(const std::vector<uint8_t>& plaintext,
+                                               const std::string& inode_id, uint64_t seg,
+                                               uint64_t version, size_t chunk_size) const {
+    return ChunkedCrypto::Encrypt(plaintext, content_key_, chunk_size, SegmentAad(inode_id, seg, version));
+}
+
 FileCodec::Result FileCodec::Decrypt(const std::vector<uint8_t>& blob,
                                      const std::string& remote_id,
                                      uint64_t expected_version,
@@ -136,6 +142,46 @@ std::unique_ptr<ChunkedWriter> FileCodec::NewWriter(std::function<bool(const uin
     return std::make_unique<ChunkedWriter>(std::move(write_fn), content_key_,
                                            chunk_size ? chunk_size : chunk_size_,
                                            Aad(remote_id, version));
+}
+
+std::vector<uint8_t> FileCodec::SegmentAad(const std::string& inode_id, uint64_t seg, uint64_t version) {
+    static const char kLabel[] = "encfs-segment-v1";
+    std::vector<uint8_t> aad(kLabel, kLabel + sizeof(kLabel));  // includes NUL separator
+    aad.insert(aad.end(), inode_id.begin(), inode_id.end());
+    aad.push_back(0);
+    AppendU64LE(aad, seg);
+    AppendU64LE(aad, version);
+    return aad;
+}
+
+std::unique_ptr<ChunkedWriter> FileCodec::NewSegmentWriter(
+    std::function<bool(const uint8_t*, size_t)> write_fn, const std::string& inode_id, uint64_t seg,
+    uint64_t version, size_t chunk_size) const {
+    return std::make_unique<ChunkedWriter>(std::move(write_fn), content_key_, chunk_size,
+                                           SegmentAad(inode_id, seg, version));
+}
+
+FileCodec::Result FileCodec::OpenSegmentReader(const std::string& path, const std::string& inode_id,
+                                               uint64_t seg, uint64_t version,
+                                               std::unique_ptr<ChunkedReader>* reader) const {
+    reader->reset();
+    auto r = ChunkedReader::Open(path, content_key_, SegmentAad(inode_id, seg, version));
+    std::vector<uint8_t> first;
+    if (!r || !r->ReadChunk(0, first)) return Result::kCorrupt;
+    SecureWipe(first);
+    *reader = std::move(r);
+    return Result::kOk;
+}
+
+FileCodec::Result FileCodec::DecryptSegment(const std::vector<uint8_t>& blob, const std::string& inode_id,
+                                            uint64_t seg, uint64_t version,
+                                            std::vector<uint8_t>& plaintext) const {
+    try {
+        plaintext = ChunkedCrypto::Decrypt(blob, content_key_, SegmentAad(inode_id, seg, version));
+        return Result::kOk;
+    } catch (const std::exception&) {
+        return Result::kCorrupt;
+    }
 }
 
 } // namespace encfs

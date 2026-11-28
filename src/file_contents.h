@@ -4,13 +4,14 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 namespace encfs {
 
-class ChunkedReader;
+class ChunkSource;
 
 // The contents of one open file, read and written chunk by chunk in bounded
 // memory, whatever the file's size.
@@ -31,7 +32,7 @@ public:
     // `base` may be null (a new or empty file). `chunk_size` must match the
     // base's chunk size when there is one. `cache_bytes` bounds the memory
     // used for chunks (at least two chunks are always allowed).
-    FileContents(std::unique_ptr<ChunkedReader> base, size_t chunk_size,
+    FileContents(std::unique_ptr<ChunkSource> base, size_t chunk_size,
                  std::string scratch_dir, size_t cache_bytes = 8 * 1024 * 1024);
     ~FileContents();
 
@@ -63,7 +64,17 @@ public:
 
     // After the contents have been written out as a new blob: adopt it as the
     // base and forget all dirty state.
-    void Rebase(std::unique_ptr<ChunkedReader> new_base);
+    void Rebase(std::unique_ptr<ChunkSource> new_base);
+
+    // The plaintext of chunk `index` (chunk_size() bytes, zero past the end)
+    // as it is now, without caching it. False if it can't be read.
+    bool LoadChunk(uint64_t index, std::vector<uint8_t>& out) { return LoadInto(index, out); }
+
+    // Chunks written or cut since construction / the last Rebase, and the
+    // size at that point: what a save needs to know to rewrite only the
+    // segments that changed.
+    const std::set<uint64_t>& touched_chunks() const { return touched_; }
+    uint64_t base_size() const { return base_size_; }
 
     // For tests: how many chunks currently live in the scratch file.
     size_t spilled_chunks() const { return spilled_.size(); }
@@ -75,13 +86,15 @@ private:
         uint64_t last_use = 0;
     };
 
-    std::unique_ptr<ChunkedReader> base_;
+    std::unique_ptr<ChunkSource> base_;
     size_t chunk_size_;
     std::string scratch_dir_;
     size_t max_slots_;
 
     uint64_t size_ = 0;
     uint64_t base_limit_ = 0;  // base bytes at or past this offset are stale (truncated)
+    uint64_t base_size_ = 0;   // size at construction / last Rebase
+    std::set<uint64_t> touched_;
     std::map<uint64_t, Slot> cache_;
     std::unordered_set<uint64_t> spilled_;
     uint64_t clock_ = 0;

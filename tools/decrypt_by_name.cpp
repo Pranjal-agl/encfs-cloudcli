@@ -12,6 +12,7 @@
 #include "file_codec.h"
 #include "index.h"
 #include "key_setup.h"
+#include "segments.h"
 #include "util.h"
 
 #include <algorithm>
@@ -84,21 +85,48 @@ struct Context {
     FileCodec* codec;
 };
 
+// The bytes of stored object `id`: the local copy, or fetched from the cloud
+// (not kept). False if neither is available.
+bool LoadObject(Context& ctx, const std::string& id, std::vector<uint8_t>& blob) {
+    const std::string path = ctx.backing_dir + "/" + id + ".enc";
+    if (ReadWholeFile(path, blob)) return true;
+    const std::string tmp = path + ".download";
+    bool fetched = ctx.cloud->Download(id, tmp) && ReadWholeFile(tmp, blob);
+    ::unlink(tmp.c_str());
+    return fetched;
+}
+
 // Fetch (if needed) and decrypt one file.
 Outcome Decrypt(Context& ctx, const FileMetadata& meta, std::vector<uint8_t>& plaintext) {
-    const std::string blob_path = ctx.backing_dir + "/" + meta.remote_id + ".enc";
     std::vector<uint8_t> blob;
-    if (!ReadWholeFile(blob_path, blob)) {
-        const std::string tmp = blob_path + ".download";
-        bool fetched = ctx.cloud->Download(meta.remote_id, tmp) && ReadWholeFile(tmp, blob);
-        ::unlink(tmp.c_str());
-        if (!fetched) {
-            if (meta.size == 0) {  // older versions wrote no blob for empty files
-                plaintext.clear();
-                return Outcome::kOk;
+    if (meta.segment_size > 0) {
+        plaintext.clear();
+        for (size_t i = 0; i < meta.segments.size(); ++i) {
+            const std::string id = SegmentObjectId(meta.remote_id, i, meta.segments[i]);
+            std::vector<uint8_t> part;
+            if (!LoadObject(ctx, id, blob)) return Outcome::kMissing;
+            if (ctx.codec->DecryptSegment(blob, meta.remote_id, i, meta.segments[i], part) !=
+                FileCodec::Result::kOk) {
+                return Outcome::kCorrupt;
             }
-            return Outcome::kMissing;
+            const uint64_t start = i * meta.segment_size;
+            const uint64_t needed = meta.size > start ? std::min<uint64_t>(meta.segment_size, meta.size - start) : 0;
+            const bool last = i + 1 == meta.segments.size();
+            if (last ? part.size() < needed || part.size() > meta.segment_size : part.size() != meta.segment_size) {
+                return Outcome::kCorrupt;  // wrong length: truncated, extended or misplaced
+            }
+            plaintext.insert(plaintext.end(), part.begin(), part.begin() + static_cast<long>(needed));
+            SecureWipe(part);
         }
+        return plaintext.size() == meta.size ? Outcome::kOk : Outcome::kCorrupt;
+    }
+
+    if (!LoadObject(ctx, meta.remote_id, blob)) {
+        if (meta.size == 0) {  // older versions wrote no blob for empty files
+            plaintext.clear();
+            return Outcome::kOk;
+        }
+        return Outcome::kMissing;
     }
     switch (ctx.codec->Decrypt(blob, meta.remote_id, meta.version, plaintext, nullptr)) {
     case FileCodec::Result::kOk: return Outcome::kOk;
@@ -118,7 +146,7 @@ int Verify(Context& ctx, EncryptedIndex& index) {
         FileMetadata meta;
         index.GetMetadata(name, meta);
         if (!meta.IsFile()) continue;
-        if (!referenced.insert(meta.remote_id + ".enc").second) continue;  // hard link: checked already
+        if (!referenced.insert(meta.remote_id).second) continue;  // hard link: checked already
         ++files;
         std::vector<uint8_t> plaintext;
         Outcome o = Decrypt(ctx, meta, plaintext);
@@ -136,9 +164,9 @@ int Verify(Context& ctx, EncryptedIndex& index) {
     size_t leftovers = 0;
     if (DIR* d = ::opendir(ctx.backing_dir.c_str())) {
         while (struct dirent* e = ::readdir(d)) {
-            std::string n = e->d_name;
-            if (n.size() == 68 && n.compare(64, 4, ".enc") == 0 && !referenced.count(n)) {
-                std::cout << "LEFTOVER\t" << n << "\n";
+            std::string id;
+            if (IsObjectFileName(e->d_name, &id) && !IndexReferencesObject(index, id)) {
+                std::cout << "LEFTOVER\t" << e->d_name << "\n";
                 ++leftovers;
             }
         }

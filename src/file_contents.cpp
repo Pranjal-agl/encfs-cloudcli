@@ -46,7 +46,7 @@ std::vector<uint8_t> IndexAad(uint64_t index) {
 }
 } // namespace
 
-FileContents::FileContents(std::unique_ptr<ChunkedReader> base, size_t chunk_size,
+FileContents::FileContents(std::unique_ptr<ChunkSource> base, size_t chunk_size,
                            std::string scratch_dir, size_t cache_bytes)
     : base_(std::move(base)),
       chunk_size_(chunk_size),
@@ -56,6 +56,7 @@ FileContents::FileContents(std::unique_ptr<ChunkedReader> base, size_t chunk_siz
         size_ = base_->plaintext_size();
         base_limit_ = size_;
     }
+    base_size_ = size_;
 }
 
 FileContents::~FileContents() {
@@ -193,6 +194,7 @@ bool FileContents::Write(uint64_t offset, const uint8_t* buf, size_t len) {
         const size_t n = std::min(len - done, chunk_size_ - in_chunk);
         std::memcpy(slot->data.data() + in_chunk, buf + done, n);
         slot->dirty = true;
+        touched_.insert(index);
         done += n;
     }
     size_ = std::max(size_, offset + len);
@@ -215,6 +217,7 @@ bool FileContents::Truncate(uint64_t new_size) {
         for (auto it = spilled_.begin(); it != spilled_.end();) {
             it = (*it >= keep) ? spilled_.erase(it) : std::next(it);
         }
+        touched_.erase(touched_.lower_bound(keep), touched_.end());
         // Zero the tail of the new last chunk, so growing later reads zeros.
         if (new_size % chunk_size_ != 0) {
             const uint64_t index = new_size / chunk_size_;
@@ -223,6 +226,7 @@ bool FileContents::Truncate(uint64_t new_size) {
             const size_t from = static_cast<size_t>(new_size - index * chunk_size_);
             std::memset(slot->data.data() + from, 0, chunk_size_ - from);
             slot->dirty = true;
+            touched_.insert(index);
         }
         base_limit_ = std::min(base_limit_, new_size);
     }
@@ -243,9 +247,11 @@ bool FileContents::ForEachChunk(const std::function<bool(const uint8_t*, size_t,
     return ok;
 }
 
-void FileContents::Rebase(std::unique_ptr<ChunkedReader> new_base) {
+void FileContents::Rebase(std::unique_ptr<ChunkSource> new_base) {
     base_ = std::move(new_base);
     base_limit_ = size_;
+    base_size_ = size_;
+    touched_.clear();
     spilled_.clear();
     if (scratch_fd_ >= 0 && ::ftruncate(scratch_fd_, 0) != 0) {
         // Not fatal: stale slots are never read once forgotten.

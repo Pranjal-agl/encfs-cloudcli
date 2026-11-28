@@ -15,6 +15,7 @@ export const FORMAT_VERSION = 2;
 export const HEADER_SIZE = 5 + 1 + 4 + 32;
 export const TAG_SIZE = 16;
 export const DEFAULT_CHUNK_SIZE = 1024 * 1024;
+export const MAX_CHUNK_SIZE = 64 * 1024 * 1024;  // ChunkedCrypto::MAX_CHUNK_SIZE
 const ROLLBACK_PROBE = 4;
 
 // ── Byte helpers ────────────────────────────────────────────────────────────
@@ -135,10 +136,12 @@ export async function decryptIndex(keys, bytes) {
   return parseIndex(plain);
 }
 
+// Index v3: "EIX3" — v2 plus, per inode, segment_size:u32 | chunk_size:u32 |
+//   count:u32 | segment versions:u64[count] (count 0 = one whole-file blob).
 // Index v2: "EIX2" | generation:u64 | inodes | paths (see src/index.h).
 // Index v1: count | (name | id | version | size | mtime)* ; empty id = directory.
 // Returns one entry per path: { name, remoteId, type, isDirectory, isSymlink,
-// version, size, mtime, mode, target, nlink }.
+// version, size, mtime, mode, target, nlink, segmentSize, chunkSize, segments }.
 export function parseIndex(plain) {
   let pos = 0;
   const need = (n) => { if (plain.length - pos < n) throw new Error("malformed index"); };
@@ -152,7 +155,8 @@ export function parseIndex(plain) {
     isDirectory: inode.type === "directory", isSymlink: inode.type === "symlink",
   });
 
-  if (plain.length >= 4 && dec.decode(plain.slice(0, 4)) === "EIX2") {
+  const magic = plain.length >= 4 ? dec.decode(plain.slice(0, 4)) : "";
+  if (magic === "EIX2" || magic === "EIX3") {
     pos = 4;
     const generation = u64();
     const inodes = new Map();
@@ -162,7 +166,22 @@ export function parseIndex(plain) {
       if (!type) throw new Error("malformed index (bad type)");
       const version = u64(), size = Number(u64()), mtime = Number(BigInt.asIntN(64, u64()));
       const mode = u32() & 0o7777, target = str();
-      inodes.set(remoteId, { remoteId, type, version, size, mtime, mode, target });
+      const inode = { remoteId, type, version, size, mtime, mode, target, segmentSize: 0, chunkSize: 0, segments: [] };
+      if (magic === "EIX3") {
+        inode.segmentSize = u32();
+        inode.chunkSize = u32();
+        const n = u32();
+        // Same validation as EncryptedIndex::Deserialize.
+        if (n > (1 << 24) || (n > 0) !== (inode.segmentSize > 0)) throw new Error("malformed index (segments)");
+        if (n > 0 && (type !== "file" || inode.chunkSize === 0 || inode.chunkSize > MAX_CHUNK_SIZE ||
+                      inode.segmentSize % inode.chunkSize !== 0)) {
+          throw new Error("malformed index (segment layout)");
+        }
+        need(8 * n);
+        for (let k = 0; k < n; k++) inode.segments.push(u64());
+      }
+      if (inodes.has(remoteId)) throw new Error("malformed index (duplicate inode)");
+      inodes.set(remoteId, inode);
     }
     const paths = [];
     for (let i = 0, n = u32(); i < n; i++) {
@@ -184,13 +203,14 @@ export function parseIndex(plain) {
     const version = u64(), size = Number(u64()), mtime = Number(BigInt.asIntN(64, u64()));
     const type = remoteId === "" ? "directory" : "file";
     entries.push(entry(name, { remoteId, type, version, size, mtime,
-                               mode: type === "directory" ? 0o755 : 0o644, target: "" }, 1));
+                               mode: type === "directory" ? 0o755 : 0o644, target: "",
+                               segmentSize: 0, chunkSize: 0, segments: [] }, 1));
   }
   if (pos !== plain.length) throw new Error("malformed index (trailing data)");
   return entries;
 }
 
-// Write index v2 from path entries (entries sharing a remoteId are hard links).
+// Write index v3 from path entries (entries sharing a remoteId are hard links).
 export function serializeIndex(entries, generation = 1) {
   const TYPE = { file: 1, directory: 2, symlink: 3 };
   const str = (v) => { const b = enc.encode(v); return [u32le(b.length), b]; };
@@ -200,11 +220,13 @@ export function serializeIndex(entries, generation = 1) {
     e.remoteId = remoteId;
     if (!inodes.has(remoteId)) inodes.set(remoteId, e);
   }
-  const parts = [enc.encode("EIX2"), u64le(generation), u32le(inodes.size)];
+  const parts = [enc.encode("EIX3"), u64le(generation), u32le(inodes.size)];
   for (const [id, e] of inodes) {
     parts.push(...str(id), new Uint8Array([TYPE[e.type || "file"]]), u64le(e.version ?? 1),
                u64le(e.size ?? 0), u64le(BigInt.asUintN(64, BigInt(e.mtime ?? 0))),
-               u32le(e.mode ?? 0o644), ...str(e.target ?? ""));
+               u32le(e.mode ?? 0o644), ...str(e.target ?? ""),
+               u32le(e.segmentSize ?? 0), u32le(e.chunkSize ?? 0), u32le((e.segments ?? []).length),
+               ...(e.segments ?? []).map((v) => u64le(v)));
   }
   parts.push(u32le(entries.length));
   for (const e of entries) parts.push(...str(e.name), ...str(e.remoteId));
@@ -259,7 +281,7 @@ export function parseBlob(blob) {
   if (version !== 2) throw new Error(`unsupported format version ${version}`);
   if (blob.length < HEADER_SIZE) throw new Error("truncated header");
   const chunkSize = getU32(blob, 6);
-  if (chunkSize === 0 || chunkSize > 64 * 1024 * 1024) throw new Error("invalid chunk size");
+  if (chunkSize === 0 || chunkSize > MAX_CHUNK_SIZE) throw new Error("invalid chunk size");
   const chunks = [];
   let off = HEADER_SIZE;
   while (off < blob.length) {
@@ -319,6 +341,54 @@ export async function decryptLegacyV1(blob, masterKey) {
 
 export async function encryptFile(keys, plaintext, remoteId, version, chunkSize) {
   return encryptBlob(plaintext, keys.content, fileAad(remoteId, version), chunkSize);
+}
+
+// ── Segmented files ─────────────────────────────────────────────────────────
+// A large file is stored as fixed-size segments, each its own blob named
+// `<inode>.<segment>.<version>.enc`, so an edit re-uploads only what changed.
+
+export function segmentAad(inodeId, seg, version) {
+  return concat(enc.encode("encfs-segment-v1\0"), enc.encode(inodeId), new Uint8Array([0]),
+                u64le(BigInt(seg)), u64le(BigInt(version)));
+}
+
+export function segmentObjectId(inodeId, seg, version) {
+  return `${inodeId}.${seg}.${BigInt(version)}`;
+}
+
+// The object ids an index entry needs (one, or one per segment).
+export function objectIds(entry) {
+  if (!entry.segmentSize) return [entry.remoteId];
+  return entry.segments.map((v, i) => segmentObjectId(entry.remoteId, i, v));
+}
+
+export async function encryptSegment(keys, plaintext, inodeId, seg, version, chunkSize) {
+  return encryptBlob(plaintext, keys.content, segmentAad(inodeId, seg, version), chunkSize);
+}
+
+// Decrypt a segmented file. `fetch(objectId)` returns the blob bytes or null.
+// Each segment is bound to its file, position and version, so a segment that
+// was swapped, reordered, replayed from an older version or cut short fails.
+// Returns { status: "ok" | "missing" | "corrupt", plaintext?, error? }.
+export async function decryptSegmented(keys, entry, fetch) {
+  const out = new Uint8Array(entry.size);
+  const segSize = entry.segmentSize;
+  for (let i = 0; i < entry.segments.length; i++) {
+    const blob = await fetch(segmentObjectId(entry.remoteId, i, entry.segments[i]));
+    if (!blob) return { status: "missing", error: `segment ${i} is not here` };
+    let part;
+    try { part = await decryptBlob(blob, keys.content, segmentAad(entry.remoteId, i, entry.segments[i])); }
+    catch { return { status: "corrupt", error: `segment ${i} failed authentication` }; }
+    const start = i * segSize;
+    const needed = Math.max(0, Math.min(segSize, entry.size - start));
+    const last = i === entry.segments.length - 1;
+    if (last ? part.length < needed || part.length > segSize : part.length !== segSize) {
+      return { status: "corrupt", error: `segment ${i} has the wrong length` };
+    }
+    out.set(part.subarray(0, needed), start);
+  }
+  if (entry.segments.length * segSize < entry.size) return { status: "corrupt", error: "segments are missing from the index" };
+  return { status: "ok", plaintext: out };
 }
 
 // Same rules as FileCodec::Decrypt: the expected version, or one ahead

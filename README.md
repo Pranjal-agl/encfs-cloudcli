@@ -18,10 +18,12 @@ Built as a systems programming project to explore FUSE internals, OpenSSL crypto
 - **Background sync** — uploads and deletes run in a worker thread with retries and exponential back-off; redundant operations are coalesced
 - **Crash-safe** — all writes are atomic (temp file + `fsync` + `rename`), and unfinished cloud operations are journaled and resumed on the next mount
 - **Constant memory, any file size** — reads decrypt only the chunks they touch, and writes keep only a few chunks in RAM. Copying in a 1 GB file peaks at 21 MB, where buffering it whole took about 2 GB.
+- **Incremental sync** — files are stored as 4 MiB segments, and a save re-encrypts and uploads only the segments it changed. Editing one byte of a 1 GB file uploads 4 MiB, not 1 GB. A read downloads only the segments it needs.
+- **Optional size padding** — with `--pad`, the cloud learns each file's size only to within a power of two
 - **Concurrent** — FUSE runs multi-threaded with per-file locking, so a slow download of one file doesn't stall `ls`, other reads or other writes
 - **Several machines, one store** — each mount picks up changes made elsewhere. Conflicting changes are detected instead of silently overwritten, and so is a rolled-back cloud index.
 - **Bounded local cache** — with `--cache-size 20G` the backing directory becomes a cache. Blobs the cloud provably holds at their current version are evicted least-recently-used first, and nothing is evicted while an upload is pending.
-- **On-demand downloads** — blobs are fetched from the cloud only when read, and verified before being cached
+- **On-demand downloads** — data is fetched from the cloud only when read, a segment at a time, and verified before being cached
 - **Restore anywhere** — the encrypted index is synced too, so your key (or passphrase) plus the cloud is enough to mount your files on a new machine
 - **Key flexibility** — a key file, or a passphrase that wraps a random master key (PBKDF2-HMAC-SHA256, 600k iterations). The passphrase can be changed without re-encrypting anything.
 - **A real POSIX namespace** — directories, hard links, symbolic links and stored permission bits. Renames, including whole directories and `RENAME_EXCHANGE`, are atomic and instant because they only touch the index.
@@ -107,15 +109,27 @@ Because every non-final chunk is exactly `chunk_size` bytes, chunk *i* sits at a
 
 Blobs written by v1 are still readable and are rewritten as v2 the next time the file is modified.
 
+### Segments
+
+Each file is stored as a sequence of **segments**: 4 MiB of plaintext each (a whole number of chunks), the last one holding the rest. Every segment is its own v2 blob and its own cloud object, named `<inode>.<segment>.<version>`:
+
+- A save writes new objects only for the segments that changed: the ones holding written or truncated chunks, plus the old and new last segment if the size changed. The index then records, per segment, the version that holds it, and the replaced objects are deleted. Objects are never overwritten in place, so a crash leaves the old version intact.
+- A segment's AAD is `"encfs-segment-v1" ‖ inode ‖ segment number ‖ version`, so a segment can't be moved to another position or file, or replaced by an older version of itself.
+- The index stores the segment and chunk size, and every segment except the last must hold exactly one segment's worth of data. A segment that's cut short, extended or swapped for another one is rejected even though it authenticates.
+- Reading part of a file opens, and if necessary downloads, only the segments involved.
+- With `--pad`, a file's last segment is padded with zeros to the next power of two (at least 1 KiB, at most one segment) when it's written. The index holds the real size, so padding is never visible through the mount.
+
+Files saved before v3.2 are a single whole-file blob named after the inode. They're still read as before and become segmented the next time they're modified.
+
 ### Index format
 
 `index.enc` maps paths (e.g. `docs/notes.txt`) to **inodes**.
 
 - **Inode fields:** an ID, a type (file, directory or symlink), a version counter, size, mtime, permission bits, and a symlink target.
-- **Where data lives:** a file inode's ID is also the name of its blob. New inodes get **random** IDs, so a blob's name says nothing about its path, and renaming never touches data.
+- **Where data lives:** a file's data is in objects named after its inode ID: one per segment, plus the version of each segment (see *Segments*). New inodes get **random** IDs, so an object's name says nothing about its path, and renaming never touches data.
 - **Hard links** are several paths pointing to one inode.
 - **Generation counter:** the index carries one, incremented on every save.
-- **Encoding:** it is serialized little-endian as format `EIX2`, then encrypted with AES-256-GCM under the index key. Indexes written by v1 and v2 are read and converted on the next save. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
+- **Encoding:** it is serialized little-endian as format `EIX3`, then encrypted with AES-256-GCM under the index key. Indexes written by older versions (`EIX2` and v1) are read and converted on the next save. After every change it is also uploaded to the cloud as the object `index` (still encrypted), and in passphrase mode the non-secret KDF parameters are uploaded as `encfs.kdf`.
 
 ### Restoring on a new machine
 
@@ -202,6 +216,8 @@ encrypted_cloudfs [options] <mountpoint> <backing_dir> [-- <fuse options>]
       --prefer-cloud  on a conflict with another machine, take the cloud's index
       --prefer-local  on a conflict, keep this machine's index and upload it
       --cache-size N  keep at most N of blobs locally (e.g. 500M, 20G); default: keep all
+      --pad           pad files so the cloud learns their sizes only to within
+                      a power of two
   -d, --debug         print FUSE debug output
 ```
 
@@ -243,11 +259,11 @@ What this can't do: `cloudcli` offers only upload, download and delete, with no 
 By default the backing directory keeps every blob, so it is a complete local copy. With `--cache-size N` it becomes a cache:
 
 - Every confirmed upload, and every verified download, records which version of a file the cloud holds, in `synced.list`.
-- When the cache is over its limit, least-recently-used blobs are deleted, but only if all of these hold:
+- When the cache is over its limit, least-recently-used objects (whole-file blobs or segments) are deleted, but only if all of these hold:
   - the cloud holds exactly the version the index expects;
   - no upload or delete is queued, in flight or journaled for it;
   - the file isn't open.
-- Evicted files are downloaded and verified again when they're next opened.
+- Evicted segments are downloaded and verified again when they're next read. Reading the start of a large file fetches only its first segment.
 - On each mount, any local blob that isn't confirmed in the cloud at its current version is uploaded again. This also catches uploads lost in a crash.
 
 If the cloud is unreachable, nothing is evicted and the cache can grow past its limit. Running out of disk space is better than losing data.
@@ -286,8 +302,9 @@ ctest --test-dir build --output-on-failure      # all suites (add -DENCFS_E2E=ON
 - **test_integration**: blob ↔ file/version binding, key resolution (hex, raw, legacy, wrong key, passphrase), the cloudcli wrapper against the stub (including shell-metacharacter paths), queue coalescing, retries and journal recovery.
 - **tests/e2e/run_e2e.sh**: mounts the real filesystem and drives it with `echo`, `cat`, `dd`, `truncate`, `mv`, `cp -p`, `touch -d`. Also checks that the cloud matches the backing dir after unmount, that evicted blobs are re-downloaded, and that tampered or swapped blobs and wrong keys are rejected. It also covers directories, restoring from the cloud alone, the cache limit (including with the cloud down), and `decrypt_by_name --verify`/`--extract-all`.
 - **test_contents**: thousands of random writes, truncates, reads and save-and-rebase cycles on `FileContents`, checked against an in-memory model with a 2-chunk cache to force spilling.
+- **test_segments**: object names, padding, the segment AAD binding (position, version, inode), `SegmentedReader`'s length checks and lazy opening, the `EIX3` fields, and which chunks an edit marks as changed.
 - **tests/web**: `web/encfs.js` and the C++ code read each other's blobs and indexes.
-- **Fuzzing** (`-DENCFS_FUZZ=ON` with clang): libFuzzer targets for the blob decoders and random-access reader (`fuzz_blob`), the index deserializer (`fuzz_index`, whose inputs are encrypted with the real key so they reach the parser), differential checks of `FileContents` against a model (`fuzz_contents`), and the sync journal (`fuzz_journal`).
+- **Fuzzing** (`-DENCFS_FUZZ=ON` with clang): libFuzzer targets for the blob decoders and random-access reader (`fuzz_blob`), the index deserializer (`fuzz_index`, whose inputs are encrypted with the real key so they reach the parser), differential checks of `FileContents` against a model (`fuzz_contents`), the sync journal (`fuzz_journal`), and `SegmentedReader` against forged, swapped and missing segments (`fuzz_segments`).
 
 CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan builds. It also fuzzes each target for 60 s and lints the shell scripts with shellcheck.
 
@@ -297,13 +314,13 @@ CI runs everything, including the FUSE tests, in Release, ASan/UBSan and TSan bu
 
 - Keep the key file at mode `0600`; the tools warn if it's readable by others.
 - Plaintext filenames and contents never appear in cloud storage or the backing directory.
-- What *is* visible to the cloud: the number of files, their approximate sizes, and when they change.
+- What *is* visible to the cloud: the number of files, their approximate sizes (only to within a power of two with `--pad`), when they change, and which 4 MiB regions of a large file an edit touched.
 - New files get random IDs. Nothing in the cloud relates to a path, so re-creating a file under the same name, or renaming one, is invisible to the cloud. Files created before v3.0 keep their old path-derived IDs, which are still opaque.
 - Key material and decrypted buffers are wiped (`OPENSSL_cleanse`) when no longer needed.
 
 ## Limitations
 
-- **Each save rewrites the whole blob**: memory stays constant, but CPU and disk time are proportional to file size, and `cloudcli` uploads the whole blob. Small edits to very large files are therefore slow to sync.
+- **Inserting into the middle of a file shifts everything after it**, so every later segment changes and is uploaded again. Appending and in-place edits are cheap.
 - **One writer at a time**: several machines can share a store, and conflicting changes are detected and refused, but not merged (see *Using several machines*).
 - **Ownership isn't stored**: everything belongs to the mounting user. Permission bits are stored and enforced (`default_permissions`). `chown` is accepted and ignored, so `rsync -a` and `cp -p` work.
 
@@ -315,12 +332,22 @@ v2 reads everything v1 wrote. One difference: v1 used the first 32 *characters* 
 
 ## Roadmap
 
-- Incremental saves: re-encrypt and upload only modified chunks. This would need per-chunk versioning in the format and a partial-upload operation in `cloudcli`.
-- Optional filename padding to hide size/length patterns
+- Master key rotation (`encfsctl rekey`)
 
 ---
 
 ## Changelog
+
+### v3.2 — incremental sync
+
+- **Segmented files:** files are stored as 4 MiB segments, each its own object named `<inode>.<segment>.<version>`. A save rewrites and uploads only the segments it changed. Changing one byte of a 20 MB file now uploads one 4 MiB segment instead of the whole file, and appending 5 MB to it uploads two segments.
+- **Partial downloads:** reading part of a file downloads only the segments involved, and `--cache-size` evicts individual segments.
+- **`--pad`:** pads each file's last segment to a power of two, so the cloud sees sizes only approximately.
+- Segments are bound to their inode, position and version, and their lengths are checked against the index, so swapped, reordered, replayed or truncated segments are rejected. Old objects are deleted only after the index that stops referencing them has been uploaded.
+- Index format `EIX3` adds each file's segment layout. Older indexes and whole-file blobs are still read, and files are converted when next modified.
+- `decrypt_by_name`, `encfsctl status` and the browser decryptor understand segmented files.
+- Unreferenced objects and temporary files left by a crash are cleaned up at mount.
+- New `test_segments` suite and `fuzz_segments` target. The e2e suite checks the exact number of uploads per edit, per-segment downloads on a new machine, truncation, padding, and tampered or moved segments.
 
 ### v3.1 — several machines
 

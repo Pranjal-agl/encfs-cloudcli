@@ -28,6 +28,18 @@ struct FileMetadata {
     uint32_t nlink = 1;    // number of paths referring to this inode (maintained by the index)
     std::string target;    // symlink target
 
+    // Storage layout of a file's contents:
+    //   segment_size == 0: one blob, `<remote_id>.enc`, bound to `version`
+    //                      (the layout before v3.2; still read)
+    //   segment_size  > 0: segments of segment_size bytes, segment i stored
+    //                      as `<remote_id>.<i>.<segments[i]>.enc`, bound to
+    //                      (remote_id, i, segments[i]). Only segments that
+    //                      change are rewritten (copy-on-write: new versions
+    //                      get new names, so the index switches atomically).
+    uint32_t segment_size = 0;
+    uint32_t chunk_size = 0;  // chunk size inside each segment (segmented only)
+    std::vector<uint64_t> segments;
+
     bool IsDirectory() const { return type == EntryType::kDirectory; }
     bool IsSymlink() const { return type == EntryType::kSymlink; }
     bool IsFile() const { return type == EntryType::kFile; }
@@ -39,12 +51,13 @@ std::string NewInodeId();
 // Encrypted index: paths (e.g. "docs/notes.txt", no leading slash) → inodes.
 // Stored as `<backing_dir>/index.enc`. All methods are thread-safe.
 //
-// Format v2 (plaintext, inside the AES-GCM envelope):
-//   "EIX2" | generation:u64 | inode_count:u32 | inodes | path_count:u32 | paths
+// Format v3 (plaintext, inside the AES-GCM envelope):
+//   "EIX3" | generation:u64 | inode_count:u32 | inodes | path_count:u32 | paths
 //   inode: id | type:u8 | version:u64 | size:u64 | mtime:i64 | mode:u32 | target
+//          | segment_size:u32 | chunk_size:u32 | segment_count:u32 | versions:u64...
 //   path:  path | inode id                       (strings are u32-length-prefixed)
-// v1 indexes (one flat entry per path, empty ID = directory) are still read
-// and are rewritten as v2 on the next save.
+// "EIX2" (the same without the segment fields) and v1 indexes (one flat entry
+// per path, empty ID = directory) are still read; saves write v3.
 class EncryptedIndex {
 public:
     EncryptedIndex(const std::string& backing_dir, const std::vector<uint8_t>& key);
